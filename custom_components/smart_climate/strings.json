@@ -1,0 +1,38 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Smart Climate Setup",
+        "description": "Configure your EcoBee-like smart thermostat.",
+        "data": {
+          "name": "Thermostat Name",
+          "real_climate": "Climate Device",
+          "inside_sensor": "Inside Temperature Sensor",
+          "outside_sensor": "Outside Temperature Sensor (optional)"
+        }
+      }
+    },
+    "error": {
+      "unknown": "Unexpected error"
+    },
+    "abort": {
+      "already_configured": "Smart Climate is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Preset Temperature Ranges",
+        "description": "Configure the comfort temperature ranges for each preset.",
+        "data": {
+          "home_min": "Home – Low Setpoint (°C)",
+          "home_max": "Home – High Setpoint (°C)",
+          "sleep_min": "Sleep – Low Setpoint (°C)",
+          "sleep_max": "Sleep – High Setpoint (°C)",
+          "away_min": "Away – Low Setpoint (°C)",
+          "away_max": "Away – High Setpoint (°C)"
+        }
+      }
+    }
+  }
+}
