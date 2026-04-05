@@ -17,5 +17,5 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: release-drafter/release-drafter@v6
-        with:
-          token: ${{ github.token }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
