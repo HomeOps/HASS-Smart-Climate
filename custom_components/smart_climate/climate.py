@@ -49,6 +49,7 @@ from .const import (
     DEFAULT_HOME_MIN,
     DEFAULT_SLEEP_MAX,
     DEFAULT_SLEEP_MIN,
+    INSIDE_DEADBAND,
     MAX_TEMP,
     MIN_TEMP,
     MIN_TEMP_DIFF,
@@ -140,6 +141,10 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # changes arriving from the real climate / sensors.
         self._updating_from_control: bool = False
         self._updating_from_real: bool = False
+
+        # Tracks the last HEAT/COOL mode sent to the real device; used by
+        # _desired_real_mode to apply hysteresis and avoid rapid cycling.
+        self._last_real_mode: HVACMode | None = None
 
     # ------------------------------------------------------------------
     # ClimateEntity properties
@@ -303,6 +308,14 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             except ValueError:
                 pass
 
+        # Seed _last_real_mode so hysteresis works correctly from the first update
+        try:
+            current_mode = HVACMode(state.state)
+            if current_mode in (HVACMode.HEAT, HVACMode.COOL):
+                self._last_real_mode = current_mode
+        except ValueError:
+            pass
+
     def _sync_from_sensors(self) -> None:
         """Pull current temperatures from the sensor entities at startup."""
         inside_state = self.hass.states.get(self._inside_sensor_id)
@@ -453,8 +466,12 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         Decision logic mirrors the ESPHome smart_climate component:
         1. If inside temp is below the low setpoint → heat
         2. If inside temp is above the high setpoint → cool
-        3. If inside temp is within range, use outside temp as tiebreaker;
-           fall back to relative position within the range.
+        3. If inside temp is within range, apply a hysteresis deadband around
+           the midpoint to prevent rapid mode cycling:
+             - If last mode was HEAT, stay in HEAT until inside > mid + INSIDE_DEADBAND
+             - If last mode was COOL, stay in COOL until inside < mid - INSIDE_DEADBAND
+        4. When no prior mode (or temp has crossed the deadband boundary), use
+           outside temperature as a tiebreaker; fall back to relative position.
         """
         if self._hvac_mode == HVACMode.OFF:
             return HVACMode.OFF
@@ -475,7 +492,15 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         if inside > high:
             return HVACMode.COOL
 
-        # Inside the comfort band – use outside temperature when available
+        # Inside the comfort band – apply hysteresis around the midpoint to
+        # prevent rapid HEAT ↔ COOL cycling when temperature hovers near centre.
+        if self._last_real_mode == HVACMode.HEAT and inside <= mid + INSIDE_DEADBAND:
+            return HVACMode.HEAT
+        if self._last_real_mode == HVACMode.COOL and inside >= mid - INSIDE_DEADBAND:
+            return HVACMode.COOL
+
+        # No prior mode, or temperature has clearly crossed the deadband boundary.
+        # Use outside temperature as a tiebreaker when available.
         if (
             self._outside_temperature is not None
             and not math.isnan(self._outside_temperature)
@@ -495,6 +520,10 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             return
 
         real_mode = self._desired_real_mode()
+        # Track the decided HEAT/COOL mode so subsequent calls can apply
+        # hysteresis and avoid rapid cycling near the midpoint.
+        if real_mode in (HVACMode.HEAT, HVACMode.COOL):
+            self._last_real_mode = real_mode
         target_temp = (
             self._preset_midpoint()
             if self._hvac_mode == HVACMode.AUTO
