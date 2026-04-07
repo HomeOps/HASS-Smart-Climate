@@ -30,3 +30,8 @@ TEMP_STEP = 0.5
 
 # Minimum allowed difference between low and high setpoints
 MIN_TEMP_DIFF = 0.5
+
+# Hysteresis deadband (°C) around the comfort-band midpoint used when the
+# inside temperature is already within the target range.  Without this buffer
+# any sensor jitter near the midpoint causes rapid HEAT ↔ COOL cycling.
+INSIDE_DEADBAND = 0.5

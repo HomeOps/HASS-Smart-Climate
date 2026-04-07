@@ -25,6 +25,7 @@ from custom_components.smart_climate.const import (
     DEFAULT_SLEEP_MAX,
     DEFAULT_AWAY_MIN,
     DEFAULT_AWAY_MAX,
+    INSIDE_DEADBAND,
     MIN_TEMP_DIFF,
 )
 
@@ -164,6 +165,89 @@ class TestDesiredRealMode:
         entity = self._entity(inside=None)
         entity._current_temperature = None
         assert entity._desired_real_mode() == HVACMode.AUTO
+
+
+class TestDesiredRealModeHysteresis:
+    """Tests for the hysteresis / anti-cycling logic in _desired_real_mode."""
+
+    def _entity(self, inside: float, last_mode: HVACMode | None = None, outside: float | None = None):
+        hass = _make_hass_mock(inside_temp=inside, outside_temp=outside)
+        config = {
+            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
+            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
+        }
+        if outside is not None:
+            config[CONF_OUTSIDE_SENSOR] = OUTSIDE_SENSOR_ID
+        entity = _make_entity(hass, config)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = inside
+        entity._outside_temperature = outside
+        entity._last_real_mode = last_mode
+        return entity
+
+    def test_in_range_last_heat_below_deadband_stays_heat(self):
+        """When last mode was HEAT and inside ≤ mid + deadband, stay in HEAT."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid, last_mode=HVACMode.HEAT)
+        assert entity._desired_real_mode() == HVACMode.HEAT
+
+    def test_in_range_last_heat_just_at_deadband_stays_heat(self):
+        """At exactly mid + deadband the HEAT mode should be retained."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid + INSIDE_DEADBAND, last_mode=HVACMode.HEAT)
+        assert entity._desired_real_mode() == HVACMode.HEAT
+
+    def test_in_range_last_heat_above_deadband_switches(self):
+        """When inside has risen past mid + deadband, switch away from HEAT."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        # Slightly above the deadband boundary – should no longer be pinned to HEAT
+        entity = self._entity(inside=mid + INSIDE_DEADBAND + 0.1, last_mode=HVACMode.HEAT)
+        # No outside sensor → fallback: inside > mid → COOL
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_in_range_last_cool_above_deadband_stays_cool(self):
+        """When last mode was COOL and inside ≥ mid - deadband, stay in COOL."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid, last_mode=HVACMode.COOL)
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_in_range_last_cool_just_at_deadband_stays_cool(self):
+        """At exactly mid - deadband the COOL mode should be retained."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid - INSIDE_DEADBAND, last_mode=HVACMode.COOL)
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_in_range_last_cool_below_deadband_switches(self):
+        """When inside has dropped past mid - deadband, switch away from COOL."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid - INSIDE_DEADBAND - 0.1, last_mode=HVACMode.COOL)
+        # No outside sensor → fallback: inside < mid → HEAT
+        assert entity._desired_real_mode() == HVACMode.HEAT
+
+    def test_no_cycling_at_midpoint_with_last_heat(self):
+        """The midpoint is exactly the most likely cycling point – must not flip."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid, last_mode=HVACMode.HEAT)
+        # Must stay HEAT, not flip to COOL
+        assert entity._desired_real_mode() == HVACMode.HEAT
+
+    def test_no_cycling_at_midpoint_with_last_cool(self):
+        """The midpoint is exactly the most likely cycling point – must not flip."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid, last_mode=HVACMode.COOL)
+        # Must stay COOL, not flip to HEAT
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_below_low_always_heats_regardless_of_last_mode(self):
+        """Below low setpoint must always HEAT regardless of prior mode."""
+        entity = self._entity(inside=DEFAULT_HOME_MIN - 0.5, last_mode=HVACMode.COOL)
+        assert entity._desired_real_mode() == HVACMode.HEAT
+
+    def test_above_high_always_cools_regardless_of_last_mode(self):
+        """Above high setpoint must always COOL regardless of prior mode."""
+        entity = self._entity(inside=DEFAULT_HOME_MAX + 0.5, last_mode=HVACMode.HEAT)
+        assert entity._desired_real_mode() == HVACMode.COOL
 
 
 # ---------------------------------------------------------------------------
