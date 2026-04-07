@@ -39,3 +39,13 @@ jobs:
           git diff --cached --quiet && echo "No changes to commit" && exit 0
           git commit -m "Update manifest.json version to ${{ steps.version.outputs.version }}"
           git push
+
+      - name: Move release tag to include manifest update
+        # The tag was created by the GitHub Release before the manifest was
+        # updated.  Force-move it so the tagged commit contains the correct
+        # version in manifest.json.  This is safe because the release was
+        # just published moments ago.
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          git tag -f "$TAG"
+          git push origin "$TAG" --force
