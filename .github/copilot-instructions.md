@@ -25,6 +25,17 @@ Version bump rules (also controlled by labels):
 
 **When opening a PR, always apply the appropriate label(s) listed above.**
 
+### How a release is made
+
+1. **release-drafter** keeps a draft GitHub Release updated as PRs are merged.
+2. A maintainer publishes the draft release (which creates a git tag).
+3. The **Release** workflow (`.github/workflows/release.yml`) triggers on the
+   `release: published` event, updates `custom_components/smart_climate/manifest.json`
+   with the version from the tag, and commits the change to `main`.
+
+> **Note:** You do not need to manually update `manifest.json` before a release.
+> The workflow handles it automatically.
+
 ## Testing
 
 Run the test suite with:
