@@ -429,18 +429,139 @@ class TestStateCallbacks:
         assert entity._hvac_action == HVACAction.HEATING
 
     def test_external_real_temperature_change_exits_preset(self):
-        """When real device setpoint drifts far from preset midpoint, go manual."""
+        """When real device setpoint drifts far from expected target, go manual."""
         entity, hass = self._entity_with_sensors()
-        midpoint = entity._preset_midpoint()
+        # With last_real_mode=COOL the expected target is the high setpoint
+        entity._last_real_mode = HVACMode.COOL
+        expected = entity._expected_real_target()
         state = MagicMock()
         state.state = HVACMode.COOL.value
         state.attributes = {
             "hvac_action": HVACAction.COOLING.value,
-            "temperature": midpoint + 3.0,  # More than 0.5 away from expected
+            "temperature": expected + 3.0,  # More than 0.5 away from expected
         }
         hass.states.get = lambda eid: state if eid == REAL_CLIMATE_ID else MagicMock()
         entity._on_real_climate_update()
         assert entity._preset_mode == PRESET_NONE
+
+    def test_external_change_stays_preset_when_target_matches(self):
+        """Real device at expected target should NOT exit preset mode."""
+        entity, hass = self._entity_with_sensors()
+        entity._last_real_mode = HVACMode.HEAT
+        expected = entity._expected_real_target()
+        state = MagicMock()
+        state.state = HVACMode.HEAT.value
+        state.attributes = {
+            "hvac_action": HVACAction.HEATING.value,
+            "temperature": expected,
+        }
+        hass.states.get = lambda eid: state if eid == REAL_CLIMATE_ID else MagicMock()
+        entity._on_real_climate_update()
+        assert entity._preset_mode == PRESET_HOME
+
+
+# ---------------------------------------------------------------------------
+# Unit tests – expected real target & mode-appropriate setpoints
+# ---------------------------------------------------------------------------
+
+class TestExpectedRealTarget:
+    """Tests for _expected_real_target – smooth temperature switching."""
+
+    def _entity(self, inside: float = 22.0, outside: float | None = None):
+        hass = _make_hass_mock(inside_temp=inside, outside_temp=outside)
+        config = {
+            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
+            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
+        }
+        if outside is not None:
+            config[CONF_OUTSIDE_SENSOR] = OUTSIDE_SENSOR_ID
+        entity = _make_entity(hass, config)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = inside
+        entity._outside_temperature = outside
+        return entity
+
+    def test_heat_targets_low_setpoint(self):
+        """In AUTO+HEAT, real device should target the low setpoint."""
+        entity = self._entity()
+        entity._last_real_mode = HVACMode.HEAT
+        assert entity._expected_real_target() == DEFAULT_HOME_MIN
+
+    def test_cool_targets_high_setpoint(self):
+        """In AUTO+COOL, real device should target the high setpoint."""
+        entity = self._entity()
+        entity._last_real_mode = HVACMode.COOL
+        assert entity._expected_real_target() == DEFAULT_HOME_MAX
+
+    def test_no_prior_mode_targets_midpoint(self):
+        """When no prior mode, fall back to midpoint."""
+        entity = self._entity()
+        entity._last_real_mode = None
+        expected_mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2.0
+        assert entity._expected_real_target() == pytest.approx(expected_mid)
+
+    def test_non_auto_mode_targets_single_setpoint(self):
+        """In HEAT/COOL single mode, target the stored single-point temp."""
+        entity = self._entity()
+        entity._hvac_mode = HVACMode.HEAT
+        entity._target_temperature = 23.0
+        assert entity._expected_real_target() == 23.0
+
+    def test_heat_to_cool_creates_dead_zone(self):
+        """Switching from HEAT to COOL should jump from low to high target.
+
+        The gap between low and high is the "dead zone" that prevents rapid
+        oscillation – the real device is not actively heating/cooling within it.
+        """
+        entity = self._entity()
+        entity._last_real_mode = HVACMode.HEAT
+        heat_target = entity._expected_real_target()
+
+        entity._last_real_mode = HVACMode.COOL
+        cool_target = entity._expected_real_target()
+
+        assert heat_target == DEFAULT_HOME_MIN
+        assert cool_target == DEFAULT_HOME_MAX
+        assert cool_target - heat_target == DEFAULT_HOME_MAX - DEFAULT_HOME_MIN
+
+    @pytest.mark.asyncio
+    async def test_sync_sends_low_when_heating(self):
+        """_async_sync_real_climate sends the low setpoint when in HEAT."""
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.HEAT.value,
+            real_climate_temp=None,
+            inside_temp=DEFAULT_HOME_MIN - 1,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = DEFAULT_HOME_MIN - 1
+        await entity._async_sync_real_climate()
+        hass.services.async_call.assert_called_once()
+        call_args = hass.services.async_call.call_args
+        assert call_args[0][0] == "climate"
+        assert call_args[0][1] == "set_temperature"
+        assert call_args[0][2]["temperature"] == DEFAULT_HOME_MIN
+
+    @pytest.mark.asyncio
+    async def test_sync_sends_high_when_cooling(self):
+        """_async_sync_real_climate sends the high setpoint when in COOL."""
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.COOL.value,
+            real_climate_temp=None,
+            inside_temp=DEFAULT_HOME_MAX + 1,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = DEFAULT_HOME_MAX + 1
+        await entity._async_sync_real_climate()
+        hass.services.async_call.assert_called_once()
+        call_args = hass.services.async_call.call_args
+        assert call_args[0][0] == "climate"
+        assert call_args[0][1] == "set_temperature"
+        assert call_args[0][2]["temperature"] == DEFAULT_HOME_MAX
 
 
 # ---------------------------------------------------------------------------
