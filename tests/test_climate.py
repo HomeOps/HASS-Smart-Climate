@@ -525,6 +525,44 @@ class TestExpectedRealTarget:
         assert cool_target == DEFAULT_HOME_MAX
         assert cool_target - heat_target == DEFAULT_HOME_MAX - DEFAULT_HOME_MIN
 
+    @pytest.mark.asyncio
+    async def test_sync_sends_low_when_heating(self):
+        """_async_sync_real_climate sends the low setpoint when in HEAT."""
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.HEAT.value,
+            real_climate_temp=None,
+            inside_temp=DEFAULT_HOME_MIN - 1,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = DEFAULT_HOME_MIN - 1
+        await entity._async_sync_real_climate()
+        hass.services.async_call.assert_called_once()
+        call_args = hass.services.async_call.call_args
+        assert call_args[0][0] == "climate"
+        assert call_args[0][1] == "set_temperature"
+        assert call_args[0][2]["temperature"] == DEFAULT_HOME_MIN
+
+    @pytest.mark.asyncio
+    async def test_sync_sends_high_when_cooling(self):
+        """_async_sync_real_climate sends the high setpoint when in COOL."""
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.COOL.value,
+            real_climate_temp=None,
+            inside_temp=DEFAULT_HOME_MAX + 1,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = DEFAULT_HOME_MAX + 1
+        await entity._async_sync_real_climate()
+        hass.services.async_call.assert_called_once()
+        call_args = hass.services.async_call.call_args
+        assert call_args[0][0] == "climate"
+        assert call_args[0][1] == "set_temperature"
+        assert call_args[0][2]["temperature"] == DEFAULT_HOME_MAX
+
 
 # ---------------------------------------------------------------------------
 # Unit tests – supported presets list
