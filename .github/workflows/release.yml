@@ -19,7 +19,7 @@ jobs:
 
       - name: Extract version from tag
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: echo "version=${{ github.event.release.tag_name }}" | sed 's/=v/=/' >> "$GITHUB_OUTPUT"
 
       - name: Update manifest.json version
         run: |
