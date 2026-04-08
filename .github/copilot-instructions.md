@@ -2,39 +2,34 @@
 
 ## Release process
 
-This repository uses **release-drafter** (`.github/release-drafter.yml`) to automate
-release notes. Releases are **not** driven by conventional-commit prefixes
-(e.g. `feat:` / `fix:`). Instead, the correct label must be applied to every PR so
-that release-drafter places it in the right section:
+This repository uses **release-please** (`.github/workflows/release-please.yml`) to
+automate releases. Releases are driven by **conventional-commit prefixes** in PR titles
+and commit messages.
 
-| Label(s) | Release-notes section |
-|---|---|
-| `feature`, `enhancement` | 🚀 Features |
-| `fix`, `bugfix`, `bug` | 🐛 Bug Fixes |
-| `test`, `tests` | 🧪 Tests |
-| `documentation`, `docs` | 📖 Documentation |
-| `chore`, `maintenance`, `dependencies` | 🧰 Maintenance |
+| Commit prefix | Version bump | Release-notes section |
+|---|---|---|
+| `feat:` / `feat(scope):` | Minor | Features |
+| `fix:` / `fix(scope):` | Patch | Bug Fixes |
+| `docs:` | Patch | Documentation |
+| `chore:` / `ci:` / `build:` / `refactor:` | Patch | (hidden by default) |
+| `feat!:` or any `!` suffix | Major | ⚠ Breaking Changes |
 
-Version bump rules (also controlled by labels):
-
-| Label(s) | Version bump |
-|---|---|
-| `major`, `breaking-change` | Major |
-| `minor`, `feature`, `enhancement` | Minor |
-| `patch`, `fix`, `bugfix`, `bug`, `documentation`, `chore`, `maintenance`, `dependencies` | Patch |
-
-**When opening a PR, always apply the appropriate label(s) listed above.**
+**Always use the appropriate conventional-commit prefix in your PR title.**
+No manual labels are required for the release process.
 
 ### How a release is made
 
-1. **release-drafter** keeps a draft GitHub Release updated as PRs are merged.
-2. A maintainer publishes the draft release (which creates a git tag).
-3. The **Release** workflow (`.github/workflows/release.yml`) triggers on the
-   `release: published` event, updates `custom_components/smart_climate/manifest.json`
-   with the version from the tag, and commits the change to `main`.
+1. Every push to `main` triggers the **release-please** workflow.
+2. release-please opens (or updates) a **Release PR** that:
+   - Bumps the version in `custom_components/smart_climate/manifest.json`.
+   - Updates `CHANGELOG.md`.
+3. A maintainer merges the Release PR.
+4. release-please creates the GitHub Release and git tag pointing at the commit
+   that already contains the correct `manifest.json` version — no post-release
+   fixup needed.
 
-> **Note:** You do not need to manually update `manifest.json` before a release.
-> The workflow handles it automatically.
+> **Note:** Do not manually edit `manifest.json` version or `CHANGELOG.md`.
+> release-please manages both automatically via the Release PR.
 
 ## Testing
 
