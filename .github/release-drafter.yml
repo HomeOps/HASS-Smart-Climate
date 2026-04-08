@@ -46,6 +46,25 @@ version-resolver:
       - "maintenance"
       - "dependencies"
   default: patch
+autolabeler:
+  - label: "fix"
+    title:
+      - "/^fix(\\(.+\\))?[!:]?\\s/i"
+      - "/^bug(\\(.+\\))?[!:]?\\s/i"
+  - label: "feature"
+    title:
+      - "/^feat(\\(.+\\))?[!:]?\\s/i"
+      - "/^feature(\\(.+\\))?[!:]?\\s/i"
+      - "/^add(\\(.+\\))?[!:]?\\s/i"
+  - label: "documentation"
+    title:
+      - "/^docs?(\\(.+\\))?[!:]?\\s/i"
+  - label: "chore"
+    title:
+      - "/^chore(\\(.+\\))?[!:]?\\s/i"
+      - "/^ci(\\(.+\\))?[!:]?\\s/i"
+      - "/^build(\\(.+\\))?[!:]?\\s/i"
+      - "/^refactor(\\(.+\\))?[!:]?\\s/i"
 template: |
   ## Changes
 
