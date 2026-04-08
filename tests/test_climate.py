@@ -320,7 +320,27 @@ class TestClimateProperties:
         entity._hvac_mode = HVACMode.AUTO
         assert entity.target_temperature_low is not None
         assert entity.target_temperature_high is not None
-        assert entity.target_temperature is None
+        # In AUTO mode target_temperature returns the range midpoint (never null)
+        assert entity.target_temperature is not None
+
+    def test_target_temperature_in_auto_is_midpoint(self):
+        """target_temperature must equal the midpoint of the active range in AUTO mode."""
+        entity = self._entity()
+        entity._hvac_mode = HVACMode.AUTO
+        entity._target_temp_low = 20.0
+        entity._target_temp_high = 24.0
+        assert entity.target_temperature == pytest.approx(22.0)
+
+    def test_target_temperature_in_auto_updates_with_range(self):
+        """Midpoint changes when the low/high setpoints are adjusted."""
+        entity = self._entity()
+        entity._hvac_mode = HVACMode.AUTO
+        entity._target_temp_low = 18.0
+        entity._target_temp_high = 22.0
+        assert entity.target_temperature == pytest.approx(20.0)
+        entity._target_temp_low = 21.0
+        entity._target_temp_high = 25.0
+        assert entity.target_temperature == pytest.approx(23.0)
 
     def test_single_target_temperature_in_heat_mode(self):
         entity = self._entity()

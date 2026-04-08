@@ -187,9 +187,16 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
     @property
     def target_temperature(self) -> float | None:
-        """Return single-point target temperature (used in HEAT / COOL modes)."""
+        """Return single-point target temperature.
+
+        In HEAT / COOL modes this is the direct user-configured setpoint.
+        In AUTO mode the midpoint of the active comfort range is returned so
+        that the ``temperature`` state attribute is never ``null`` – it gives
+        users a meaningful reference value while ``target_temp_low`` /
+        ``target_temp_high`` still describe the full range.
+        """
         if self._hvac_mode == HVACMode.AUTO:
-            return None
+            return (self._target_temp_low + self._target_temp_high) / 2.0
         return self._target_temperature
 
     @property
