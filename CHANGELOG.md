@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.7](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.0.6...v0.0.7) (2026-04-08)
+
+
+### Bug Fixes
+
+* Return range midpoint as `temperature` in AUTO mode instead of null ([#16](https://github.com/HomeOps/HASS-Smart-Climate/issues/16)) ([38edd75](https://github.com/HomeOps/HASS-Smart-Climate/commit/38edd754454ee6a49395e7af8e0329ceea9e219e))
+
 ## [0.0.6](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.0.5...v0.0.6) (2026-04-08)
 
 
