@@ -385,7 +385,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         ):
             real_target = state.attributes.get("temperature")
             if real_target is not None:
-                expected = self._preset_midpoint()
+                expected = self._expected_real_target()
                 if abs(float(real_target) - expected) > 0.5:
                     _LOGGER.debug(
                         "Real climate setpoint changed externally "
@@ -521,6 +521,23 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
     # Real-climate synchronisation
     # ------------------------------------------------------------------
 
+    def _expected_real_target(self) -> float:
+        """Return the temperature the real device should currently be set to.
+
+        In AUTO mode the target depends on whether we are heating or cooling:
+        HEAT targets the *low* setpoint and COOL targets the *high* setpoint.
+        This creates a natural dead-zone between the two setpoints, greatly
+        reducing HEAT ↔ COOL oscillation.
+        """
+        if self._hvac_mode != HVACMode.AUTO:
+            return self._target_temperature
+        low, high = self._active_range()
+        if self._last_real_mode == HVACMode.HEAT:
+            return low
+        if self._last_real_mode == HVACMode.COOL:
+            return high
+        return self._preset_midpoint()
+
     async def _async_sync_real_climate(self) -> None:
         """Push the desired mode and setpoint to the real climate device."""
         if self._updating_from_real or self._updating_from_control:
@@ -531,11 +548,22 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # hysteresis and avoid rapid cycling near the midpoint.
         if real_mode in (HVACMode.HEAT, HVACMode.COOL):
             self._last_real_mode = real_mode
-        target_temp = (
-            self._preset_midpoint()
-            if self._hvac_mode == HVACMode.AUTO
-            else self._target_temperature
-        )
+
+        # In AUTO mode, target the *low* setpoint when heating and the *high*
+        # setpoint when cooling.  This prevents the real device from actively
+        # heating/cooling into the comfort band's interior and eliminates the
+        # rapid temperature oscillation that occurs when both modes chase the
+        # same midpoint target.
+        if self._hvac_mode == HVACMode.AUTO:
+            low, high = self._active_range()
+            if real_mode == HVACMode.HEAT:
+                target_temp = low
+            elif real_mode == HVACMode.COOL:
+                target_temp = high
+            else:
+                target_temp = self._preset_midpoint()
+        else:
+            target_temp = self._target_temperature
 
         real_state = self.hass.states.get(self._real_climate_id)
         if real_state is None:
