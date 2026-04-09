@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.8](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.0.7...v0.0.8) (2026-04-09)
+
+
+### Bug Fixes
+
+* cool to `high - 1` to prevent integer-device upper-band overshoot ([#23](https://github.com/HomeOps/HASS-Smart-Climate/issues/23)) ([1bf6679](https://github.com/HomeOps/HASS-Smart-Climate/commit/1bf667936a58f506b62e322a87dd710f25a05296))
+
 ## [0.0.7](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.0.6...v0.0.7) (2026-04-08)
 
 
