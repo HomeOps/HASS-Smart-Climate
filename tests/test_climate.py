@@ -508,11 +508,11 @@ class TestExpectedRealTarget:
         entity._last_real_mode = HVACMode.HEAT
         assert entity._expected_real_target() == DEFAULT_HOME_MIN
 
-    def test_cool_targets_high_setpoint(self):
-        """In AUTO+COOL, real device should target the high setpoint."""
+    def test_cool_targets_high_minus_one(self):
+        """In AUTO+COOL, real device should target high - 1 to avoid integer overshoot."""
         entity = self._entity()
         entity._last_real_mode = HVACMode.COOL
-        assert entity._expected_real_target() == DEFAULT_HOME_MAX
+        assert entity._expected_real_target() == DEFAULT_HOME_MAX - 1
 
     def test_no_prior_mode_targets_midpoint(self):
         """When no prior mode, fall back to midpoint."""
@@ -529,10 +529,12 @@ class TestExpectedRealTarget:
         assert entity._expected_real_target() == 23.0
 
     def test_heat_to_cool_creates_dead_zone(self):
-        """Switching from HEAT to COOL should jump from low to high target.
+        """Switching from HEAT to COOL should jump from low to high-1 target.
 
-        The gap between low and high is the "dead zone" that prevents rapid
+        The gap between low and high-1 is the "dead zone" that prevents rapid
         oscillation – the real device is not actively heating/cooling within it.
+        Using high-1 (rather than high) prevents integer-only devices from
+        overshooting to high+0.5 and appearing to breach the upper band.
         """
         entity = self._entity()
         entity._last_real_mode = HVACMode.HEAT
@@ -542,8 +544,8 @@ class TestExpectedRealTarget:
         cool_target = entity._expected_real_target()
 
         assert heat_target == DEFAULT_HOME_MIN
-        assert cool_target == DEFAULT_HOME_MAX
-        assert cool_target - heat_target == DEFAULT_HOME_MAX - DEFAULT_HOME_MIN
+        assert cool_target == DEFAULT_HOME_MAX - 1
+        assert cool_target - heat_target == DEFAULT_HOME_MAX - DEFAULT_HOME_MIN - 1
 
     @pytest.mark.asyncio
     async def test_sync_sends_low_when_heating(self):
@@ -565,8 +567,8 @@ class TestExpectedRealTarget:
         assert call_args[0][2]["temperature"] == DEFAULT_HOME_MIN
 
     @pytest.mark.asyncio
-    async def test_sync_sends_high_when_cooling(self):
-        """_async_sync_real_climate sends the high setpoint when in COOL."""
+    async def test_sync_sends_high_minus_one_when_cooling(self):
+        """_async_sync_real_climate sends high-1 when in COOL to avoid integer overshoot."""
         hass = _make_hass_mock(
             real_climate_state=HVACMode.COOL.value,
             real_climate_temp=None,
@@ -581,7 +583,42 @@ class TestExpectedRealTarget:
         call_args = hass.services.async_call.call_args
         assert call_args[0][0] == "climate"
         assert call_args[0][1] == "set_temperature"
-        assert call_args[0][2]["temperature"] == DEFAULT_HOME_MAX
+        assert call_args[0][2]["temperature"] == DEFAULT_HOME_MAX - 1
+
+    @pytest.mark.asyncio
+    async def test_sync_cool_target_21_23_band(self):
+        """Issue regression: 21-23 band → cooling target must be 22, not 23.
+
+        When the band is 21-23 and the real device only accepts integers, using
+        23 as the cooling target allows the device's own ±0.5 °C hysteresis to
+        reach 23.5, which rounds to 24.  Using 22 (high - 1) keeps the
+        effective upper temperature within the configured band.
+        """
+        low, high = 21.0, 23.0
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.COOL.value,
+            real_climate_temp=None,
+            inside_temp=high + 0.1,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_NONE
+        entity._target_temp_low = low
+        entity._target_temp_high = high
+        entity._current_temperature = high + 0.1
+        await entity._async_sync_real_climate()
+        call_args = hass.services.async_call.call_args
+        assert call_args[0][2]["temperature"] == high - 1  # 22, not 23
+
+    def test_cool_target_capped_at_low_for_narrow_band(self):
+        """Narrow band: cooling target must not drop below the low setpoint."""
+        entity = self._entity()
+        entity._preset_mode = PRESET_NONE
+        entity._target_temp_low = 22.0
+        entity._target_temp_high = 22.5  # only 0.5 °C wide
+        entity._last_real_mode = HVACMode.COOL
+        # high - 1 = 21.5 < low = 22.0, so result must be capped at low
+        assert entity._expected_real_target() == 22.0
 
 
 # ---------------------------------------------------------------------------

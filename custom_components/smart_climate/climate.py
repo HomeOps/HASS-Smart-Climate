@@ -525,9 +525,12 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         """Return the temperature the real device should currently be set to.
 
         In AUTO mode the target depends on whether we are heating or cooling:
-        HEAT targets the *low* setpoint and COOL targets the *high* setpoint.
-        This creates a natural dead-zone between the two setpoints, greatly
-        reducing HEAT ↔ COOL oscillation.
+        HEAT targets the *low* setpoint and COOL targets one below the *high*
+        setpoint (high - 1).  Using high - 1 prevents real devices that only
+        accept integer setpoints from overshooting to high + 0.5 due to their
+        own internal hysteresis, which would push the effective upper limit one
+        degree above the configured band.  The result is capped at low so it
+        never falls below the heating target for very narrow bands.
         """
         if self._hvac_mode != HVACMode.AUTO:
             return self._target_temperature
@@ -535,7 +538,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         if self._last_real_mode == HVACMode.HEAT:
             return low
         if self._last_real_mode == HVACMode.COOL:
-            return high
+            return max(low, high - 1)
         return self._preset_midpoint()
 
     async def _async_sync_real_climate(self) -> None:
@@ -559,7 +562,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             if real_mode == HVACMode.HEAT:
                 target_temp = low
             elif real_mode == HVACMode.COOL:
-                target_temp = high
+                target_temp = max(low, high - 1)
             else:
                 target_temp = self._preset_midpoint()
         else:
