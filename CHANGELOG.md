@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.9](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.0.8...v0.0.9) (2026-04-13)
+
+
+### Bug Fixes
+
+* engage cooling at high - deadband instead of above high setpoint ([#26](https://github.com/HomeOps/HASS-Smart-Climate/issues/26)) ([e5dc4af](https://github.com/HomeOps/HASS-Smart-Climate/commit/e5dc4afd7ce15e2b072e09488724cf7ac2156400))
+
 ## [0.0.8](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.0.7...v0.0.8) (2026-04-09)
 
 
