@@ -905,3 +905,5 @@ class TestStateRestoration:
         assert "sync" in call_order
         assert "subscribe" in call_order
         assert call_order.index("sync") < call_order.index("subscribe")
+        # Preset must remain intact after the full lifecycle
+        assert entity._preset_mode == PRESET_AWAY
