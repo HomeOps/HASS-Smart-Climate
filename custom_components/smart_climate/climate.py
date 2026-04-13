@@ -288,6 +288,11 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         self._sync_from_real_climate()
         self._sync_from_sensors()
 
+        # Push the restored state to the real climate device so that the
+        # correct heat/cool commands are sent after a HA restart.
+        if self._hvac_mode != HVACMode.OFF:
+            await self._async_sync_real_climate()
+
     @callback
     def _async_entity_state_changed(self, event: Any) -> None:
         """Dispatch state-change events to the appropriate handler."""
