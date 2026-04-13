@@ -472,7 +472,10 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
         Decision logic mirrors the ESPHome smart_climate component:
         1. If inside temp is below the low setpoint → heat
-        2. If inside temp is above the high setpoint → cool
+        2. If inside temp is at or above high - INSIDE_DEADBAND → cool.
+           This engages cooling *before* the temperature exits the comfort
+           band, giving the system time to react and preventing overshoot
+           (analogous to the cool target using high - 1).
         3. If inside temp is within range, apply a hysteresis deadband around
            the midpoint to prevent rapid mode cycling:
              - If last mode was HEAT, stay in HEAT until inside > mid + INSIDE_DEADBAND
@@ -496,7 +499,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
         if inside < low:
             return HVACMode.HEAT
-        if inside > high:
+        if inside >= high - INSIDE_DEADBAND:
             return HVACMode.COOL
 
         # Inside the comfort band – apply hysteresis around the midpoint to
