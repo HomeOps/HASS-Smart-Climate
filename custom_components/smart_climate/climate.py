@@ -271,7 +271,20 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             if ATTR_TEMPERATURE in attrs and attrs[ATTR_TEMPERATURE] is not None:
                 self._target_temperature = float(attrs[ATTR_TEMPERATURE])
 
-        # Subscribe to state changes on all tracked entities
+        # Populate initial state from current entity states
+        self._sync_from_real_climate()
+        self._sync_from_sensors()
+
+        # Push the restored state to the real climate device so that the
+        # correct heat/cool commands are sent after a HA restart.
+        if self._hvac_mode != HVACMode.OFF:
+            await self._async_sync_real_climate()
+
+        # Subscribe to state changes on all tracked entities.  This is done
+        # *after* the initial sync so that stale state-change events from the
+        # real climate device (whose setpoint may not yet match the restored
+        # preset) do not trigger false "external change" detection and reset
+        # the preset to NONE.
         entities_to_track = [self._real_climate_id, self._inside_sensor_id]
         if self._outside_sensor_id:
             entities_to_track.append(self._outside_sensor_id)
@@ -283,10 +296,6 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
                 self._async_entity_state_changed,
             )
         )
-
-        # Populate initial state from current entity states
-        self._sync_from_real_climate()
-        self._sync_from_sensors()
 
     @callback
     def _async_entity_state_changed(self, event: Any) -> None:

@@ -687,3 +687,223 @@ def test_supported_presets_list():
     assert PRESET_AWAY in SUPPORTED_PRESETS
     assert PRESET_NONE in SUPPORTED_PRESETS
     assert len(SUPPORTED_PRESETS) == 4
+
+
+# ---------------------------------------------------------------------------
+# Unit tests – state restoration on startup
+# ---------------------------------------------------------------------------
+
+class TestStateRestoration:
+    """Tests for async_added_to_hass state restoration and real device sync."""
+
+    def _make_last_state(
+        self,
+        hvac_mode: str = HVACMode.AUTO.value,
+        preset_mode: str = PRESET_SLEEP,
+        target_temp_low: float = DEFAULT_SLEEP_MIN,
+        target_temp_high: float = DEFAULT_SLEEP_MAX,
+        temperature: float | None = None,
+    ) -> MagicMock:
+        """Build a mock last_state object mimicking HA's RestoreEntity."""
+        state = MagicMock()
+        state.state = hvac_mode
+        attrs = {
+            "preset_mode": preset_mode,
+            "target_temp_low": target_temp_low,
+            "target_temp_high": target_temp_high,
+        }
+        if temperature is not None:
+            attrs["temperature"] = temperature
+        state.attributes = attrs
+        return state
+
+    async def _setup_entity(
+        self,
+        last_state: MagicMock | None,
+        inside_temp: float = 20.0,
+        real_climate_state: str = HVACMode.OFF.value,
+        real_climate_temp: float | None = None,
+    ) -> tuple[SmartClimateEntity, MagicMock]:
+        """Create an entity and run async_added_to_hass with the given last_state."""
+        hass = _make_hass_mock(
+            real_climate_state=real_climate_state,
+            real_climate_temp=real_climate_temp,
+            inside_temp=inside_temp,
+        )
+        entity = _make_entity(hass)
+
+        # Mock the RestoreEntity and lifecycle methods
+        with patch.object(
+            SmartClimateEntity, "async_get_last_state", return_value=last_state
+        ), patch.object(
+            SmartClimateEntity, "async_on_remove"
+        ), patch(
+            "custom_components.smart_climate.climate.async_track_state_change_event"
+        ), patch.object(
+            SmartClimateEntity, "async_write_ha_state"
+        ):
+            await entity.async_added_to_hass()
+
+        return entity, hass
+
+    @pytest.mark.asyncio
+    async def test_preset_restored_from_last_state(self):
+        """Preset (profile) should be restored when HASS restarts."""
+        last_state = self._make_last_state(preset_mode=PRESET_SLEEP)
+        entity, _ = await self._setup_entity(last_state)
+        assert entity._preset_mode == PRESET_SLEEP
+
+    @pytest.mark.asyncio
+    async def test_away_preset_restored(self):
+        """Away preset should be restored correctly."""
+        last_state = self._make_last_state(
+            preset_mode=PRESET_AWAY,
+            target_temp_low=DEFAULT_AWAY_MIN,
+            target_temp_high=DEFAULT_AWAY_MAX,
+        )
+        entity, _ = await self._setup_entity(last_state)
+        assert entity._preset_mode == PRESET_AWAY
+        assert entity._target_temp_low == DEFAULT_AWAY_MIN
+        assert entity._target_temp_high == DEFAULT_AWAY_MAX
+
+    @pytest.mark.asyncio
+    async def test_hvac_mode_restored_from_last_state(self):
+        """HVAC mode should be restored from the last saved state."""
+        last_state = self._make_last_state(hvac_mode=HVACMode.AUTO.value)
+        entity, _ = await self._setup_entity(last_state)
+        assert entity._hvac_mode == HVACMode.AUTO
+
+    @pytest.mark.asyncio
+    async def test_temperatures_restored_from_last_state(self):
+        """Temperature setpoints should be restored from the last saved state."""
+        last_state = self._make_last_state(
+            target_temp_low=19.5, target_temp_high=23.5, temperature=21.5
+        )
+        entity, _ = await self._setup_entity(last_state)
+        assert entity._target_temp_low == 19.5
+        assert entity._target_temp_high == 23.5
+        assert entity._target_temperature == 21.5
+
+    @pytest.mark.asyncio
+    async def test_real_device_synced_on_restore_auto(self):
+        """Real climate device should receive heat/cool on startup when restored to AUTO."""
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.AUTO.value,
+            preset_mode=PRESET_SLEEP,
+        )
+        entity, hass = await self._setup_entity(
+            last_state,
+            inside_temp=DEFAULT_SLEEP_MIN - 1,  # Below low → should HEAT
+        )
+        # The real device should have been told to heat
+        hass.services.async_call.assert_called()
+        call_args = hass.services.async_call.call_args
+        assert call_args[0][0] == "climate"
+        assert call_args[0][1] == "set_temperature"
+        assert call_args[0][2]["hvac_mode"] == HVACMode.HEAT.value
+
+    @pytest.mark.asyncio
+    async def test_real_device_synced_on_restore_heat(self):
+        """Real climate device should receive HEAT on startup when restored to HEAT mode."""
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.HEAT.value,
+            preset_mode=PRESET_HOME,
+            temperature=22.0,
+        )
+        entity, hass = await self._setup_entity(
+            last_state,
+            inside_temp=20.0,
+            real_climate_temp=None,
+        )
+        hass.services.async_call.assert_called()
+        call_args = hass.services.async_call.call_args
+        assert call_args[0][0] == "climate"
+        assert call_args[0][1] == "set_temperature"
+        assert call_args[0][2]["hvac_mode"] == HVACMode.HEAT.value
+
+    @pytest.mark.asyncio
+    async def test_real_device_not_synced_when_off(self):
+        """Real device should NOT be sent commands when restored state is OFF."""
+        last_state = self._make_last_state(hvac_mode=HVACMode.OFF.value)
+        entity, hass = await self._setup_entity(last_state)
+        assert entity._hvac_mode == HVACMode.OFF
+        hass.services.async_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_no_last_state_defaults_to_off(self):
+        """No saved state should leave entity at default OFF with no real device sync."""
+        entity, hass = await self._setup_entity(last_state=None)
+        assert entity._hvac_mode == HVACMode.OFF
+        assert entity._preset_mode == PRESET_HOME
+        hass.services.async_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_invalid_preset_defaults_to_home(self):
+        """Invalid preset in last state should fall back to PRESET_HOME."""
+        last_state = self._make_last_state(preset_mode="invalid_preset")
+        entity, _ = await self._setup_entity(last_state)
+        assert entity._preset_mode == PRESET_HOME
+
+    @pytest.mark.asyncio
+    async def test_preset_not_reset_by_stale_real_device_temp(self):
+        """Preset must NOT be reset to NONE by a mismatched real device temp on startup.
+
+        Before the fix, the real device's stale setpoint from before the
+        restart would trigger the external-change detection in
+        _on_real_climate_update, falsely resetting the preset to NONE.  By
+        subscribing to state changes *after* the initial sync, stale events
+        cannot fire during setup.
+        """
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.AUTO.value,
+            preset_mode=PRESET_SLEEP,
+            target_temp_low=DEFAULT_SLEEP_MIN,
+            target_temp_high=DEFAULT_SLEEP_MAX,
+        )
+        # Real device has a very different temperature (stale from before restart)
+        entity, hass = await self._setup_entity(
+            last_state,
+            inside_temp=20.0,
+            real_climate_state=HVACMode.COOL.value,
+            real_climate_temp=25.0,  # Far from expected → would trigger false reset
+        )
+        # Preset must still be SLEEP, not reset to NONE
+        assert entity._preset_mode == PRESET_SLEEP
+
+    @pytest.mark.asyncio
+    async def test_subscription_happens_after_sync(self):
+        """State-change subscription must occur after sync to prevent false resets."""
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.AUTO.value,
+            preset_mode=PRESET_AWAY,
+        )
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.OFF.value,
+            real_climate_temp=None,
+            inside_temp=20.0,
+        )
+        entity = _make_entity(hass)
+
+        call_order = []
+
+        with patch.object(
+            SmartClimateEntity, "async_get_last_state", return_value=last_state
+        ), patch.object(
+            SmartClimateEntity, "async_on_remove",
+            side_effect=lambda _: call_order.append("subscribe"),
+        ), patch(
+            "custom_components.smart_climate.climate.async_track_state_change_event",
+        ), patch.object(
+            SmartClimateEntity, "async_write_ha_state"
+        ), patch.object(
+            entity, "_async_sync_real_climate",
+            side_effect=lambda: call_order.append("sync"),
+        ):
+            await entity.async_added_to_hass()
+
+        # sync must come before subscribe
+        assert "sync" in call_order
+        assert "subscribe" in call_order
+        assert call_order.index("sync") < call_order.index("subscribe")
+        # Preset must remain intact after the full lifecycle
+        assert entity._preset_mode == PRESET_AWAY
