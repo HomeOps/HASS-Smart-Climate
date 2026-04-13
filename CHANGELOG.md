@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.0.10](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.0.9...v0.0.10) (2026-04-13)
+
+
+### Bug Fixes
+
+* restore preset and sync real climate device on HA restart ([#29](https://github.com/HomeOps/HASS-Smart-Climate/issues/29)) ([a817bf4](https://github.com/HomeOps/HASS-Smart-Climate/commit/a817bf478772bc0b4caf24b33fd9761c39910970))
+
 ## [0.0.9](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.0.8...v0.0.9) (2026-04-13)
 
 
