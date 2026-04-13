@@ -843,3 +843,65 @@ class TestStateRestoration:
         last_state = self._make_last_state(preset_mode="invalid_preset")
         entity, _ = await self._setup_entity(last_state)
         assert entity._preset_mode == PRESET_HOME
+
+    @pytest.mark.asyncio
+    async def test_preset_not_reset_by_stale_real_device_temp(self):
+        """Preset must NOT be reset to NONE by a mismatched real device temp on startup.
+
+        Before the fix, the real device's stale setpoint from before the
+        restart would trigger the external-change detection in
+        _on_real_climate_update, falsely resetting the preset to NONE.  By
+        subscribing to state changes *after* the initial sync, stale events
+        cannot fire during setup.
+        """
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.AUTO.value,
+            preset_mode=PRESET_SLEEP,
+            target_temp_low=DEFAULT_SLEEP_MIN,
+            target_temp_high=DEFAULT_SLEEP_MAX,
+        )
+        # Real device has a very different temperature (stale from before restart)
+        entity, hass = await self._setup_entity(
+            last_state,
+            inside_temp=20.0,
+            real_climate_state=HVACMode.COOL.value,
+            real_climate_temp=25.0,  # Far from expected → would trigger false reset
+        )
+        # Preset must still be SLEEP, not reset to NONE
+        assert entity._preset_mode == PRESET_SLEEP
+
+    @pytest.mark.asyncio
+    async def test_subscription_happens_after_sync(self):
+        """State-change subscription must occur after sync to prevent false resets."""
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.AUTO.value,
+            preset_mode=PRESET_AWAY,
+        )
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.OFF.value,
+            real_climate_temp=None,
+            inside_temp=20.0,
+        )
+        entity = _make_entity(hass)
+
+        call_order = []
+
+        with patch.object(
+            SmartClimateEntity, "async_get_last_state", return_value=last_state
+        ), patch.object(
+            SmartClimateEntity, "async_on_remove",
+            side_effect=lambda _: call_order.append("subscribe"),
+        ), patch(
+            "custom_components.smart_climate.climate.async_track_state_change_event",
+        ), patch.object(
+            SmartClimateEntity, "async_write_ha_state"
+        ), patch.object(
+            entity, "_async_sync_real_climate",
+            side_effect=lambda: call_order.append("sync"),
+        ):
+            await entity.async_added_to_hass()
+
+        # sync must come before subscribe
+        assert "sync" in call_order
+        assert "subscribe" in call_order
+        assert call_order.index("sync") < call_order.index("subscribe")
