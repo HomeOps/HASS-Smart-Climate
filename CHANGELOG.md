@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.0.10...v0.1.0) (2026-04-14)
+
+
+### Features
+
+* turn off real climate when in-band; fix heat activation at low setpoint ([#32](https://github.com/HomeOps/HASS-Smart-Climate/issues/32)) ([e5d50dc](https://github.com/HomeOps/HASS-Smart-Climate/commit/e5d50dcf7a12ceba954e1229d774d9140e5a1099))
+
 ## [0.0.10](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.0.9...v0.0.10) (2026-04-13)
 
 
