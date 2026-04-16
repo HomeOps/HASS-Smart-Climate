@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.1.0...v0.1.1) (2026-04-16)
+
+
+### Bug Fixes
+
+* use outside sensor to avoid excessive off/heat/cool cycling in comfort band ([#35](https://github.com/HomeOps/HASS-Smart-Climate/issues/35)) ([7aaa094](https://github.com/HomeOps/HASS-Smart-Climate/commit/7aaa0940b88bfd2a27bc5e04f37b2ab981eab871))
+
 ## [0.1.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.0.10...v0.1.0) (2026-04-14)
 
 
