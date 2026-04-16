@@ -162,16 +162,22 @@ class TestDesiredRealMode:
         entity = self._entity(inside=mid)
         assert entity._desired_real_mode() == HVACMode.OFF
 
-    def test_auto_in_range_cold_outside_returns_off(self):
-        """Inside temp in range → OFF even with cold outside sensor."""
+    def test_auto_in_range_cold_outside_returns_heat(self):
+        """Inside temp in range, cold outside → HEAT to avoid off/heat cycling."""
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=mid - 5)
-        assert entity._desired_real_mode() == HVACMode.OFF
+        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
+        assert entity._desired_real_mode() == HVACMode.HEAT
 
-    def test_auto_in_range_warm_outside_returns_off(self):
-        """Inside temp in range → OFF even with warm outside sensor."""
+    def test_auto_in_range_warm_outside_returns_cool(self):
+        """Inside temp in range, warm outside → COOL to avoid off/cool cycling."""
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=mid + 5)
+        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MAX + 5)
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_auto_in_range_outside_in_range_returns_off(self):
+        """Inside temp in range, outside also in range → OFF."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid, outside=mid)
         assert entity._desired_real_mode() == HVACMode.OFF
 
     def test_auto_in_range_no_outside_sensor_below_mid_returns_off(self):
