@@ -515,7 +515,21 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         if inside <= low + INSIDE_DEADBAND:
             return HVACMode.HEAT
 
-        # Temperature is comfortably within the band – turn the real device off.
+        # Temperature is comfortably within the band.
+        # Use the outside sensor to decide whether to maintain HEAT or COOL
+        # instead of turning the device off.  This avoids rapid off/heat/off
+        # (winter) or off/cool/off (summer) cycling when the inside temp
+        # fluctuates near the midpoint of the comfort range.
+        if self._outside_temperature is not None and not math.isnan(
+            self._outside_temperature
+        ):
+            if self._outside_temperature < low:
+                return HVACMode.HEAT
+            if self._outside_temperature > high:
+                return HVACMode.COOL
+
+        # No outside sensor, or outside temp is within the comfort range –
+        # turn the real device off (no reliable signal to pick a direction).
         return HVACMode.OFF
 
     # ------------------------------------------------------------------
