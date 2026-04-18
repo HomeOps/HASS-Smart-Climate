@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.1.1...v0.2.0) (2026-04-18)
+
+
+### Features
+
+* turn off HVAC after 15 min stable in comfort band ([#38](https://github.com/HomeOps/HASS-Smart-Climate/issues/38)) ([dbab246](https://github.com/HomeOps/HASS-Smart-Climate/commit/dbab24607e94b767c907072fa851d7e8d4042a28))
+
 ## [0.1.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.1.0...v0.1.1) (2026-04-16)
 
 
