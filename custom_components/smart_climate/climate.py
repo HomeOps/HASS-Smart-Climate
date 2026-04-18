@@ -8,6 +8,7 @@ Wraps a physical climate device and adds:
 """
 from __future__ import annotations
 
+import datetime
 import logging
 import math
 from typing import Any
@@ -53,6 +54,7 @@ from .const import (
     MAX_TEMP,
     MIN_TEMP,
     MIN_TEMP_DIFF,
+    STABLE_IN_BAND_TIMEOUT,
     TEMP_STEP,
 )
 
@@ -145,6 +147,12 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # Tracks the last HEAT/COOL mode sent to the real device; used by
         # _desired_real_mode to apply hysteresis and avoid rapid cycling.
         self._last_real_mode: HVACMode | None = None
+
+        # Timestamp at which the inside temperature first entered the
+        # comfortable mid-band zone (between low+deadband and high-deadband).
+        # Used to enforce STABLE_IN_BAND_TIMEOUT: the outside-sensor HEAT/COOL
+        # bias is only kept for this long before we force the device off.
+        self._in_band_since: datetime.datetime | None = None
 
     # ------------------------------------------------------------------
     # ClimateEntity properties
@@ -511,16 +519,28 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # For sub-1 °C bands the device will be either HEAT or COOL (never OFF);
         # COOL is checked first to avoid over-heating a near-target room.
         if inside >= high - INSIDE_DEADBAND:
+            self._in_band_since = None  # exited the comfortable zone
             return HVACMode.COOL
         if inside <= low + INSIDE_DEADBAND:
+            self._in_band_since = None  # exited the comfortable zone
             return HVACMode.HEAT
 
         # Temperature is comfortably within the band.
+        # Record when we first entered this comfortable state so we can enforce
+        # a maximum run time for the outside-sensor HEAT/COOL bias.
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if self._in_band_since is None:
+            self._in_band_since = now
+
         # Use the outside sensor to decide whether to maintain HEAT or COOL
         # instead of turning the device off.  This avoids rapid off/heat/off
         # (winter) or off/cool/off (summer) cycling when the inside temp
         # fluctuates near the midpoint of the comfort range.
-        if self._outside_temperature is not None and not math.isnan(
+        # However, if the temperature has been stable in the band for longer
+        # than STABLE_IN_BAND_TIMEOUT, the room is genuinely comfortable and
+        # continuing to run the HVAC wastes energy – turn it off regardless.
+        elapsed = (now - self._in_band_since).total_seconds()
+        if elapsed < STABLE_IN_BAND_TIMEOUT and self._outside_temperature is not None and not math.isnan(
             self._outside_temperature
         ):
             if self._outside_temperature < low:
@@ -528,8 +548,8 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             if self._outside_temperature > high:
                 return HVACMode.COOL
 
-        # No outside sensor, or outside temp is within the comfort range –
-        # turn the real device off (no reliable signal to pick a direction).
+        # No outside sensor, outside temp is within the comfort range, or the
+        # inside temperature has been comfortable for too long – turn off.
         return HVACMode.OFF
 
     # ------------------------------------------------------------------
