@@ -664,6 +664,23 @@ class TestStateCallbacks:
         entity._on_real_climate_update()
         assert entity._preset_mode == PRESET_HOME
 
+    def test_real_device_off_does_not_exit_preset(self):
+        """Real device transitioning to OFF (normal AUTO comfort-band behavior)
+        must not trigger external-change detection and clear the preset."""
+        entity, hass = self._entity_with_sensors()
+        entity._last_real_mode = HVACMode.COOL
+        expected = entity._expected_real_target()
+        state = MagicMock()
+        state.state = HVACMode.OFF.value
+        state.attributes = {
+            "hvac_action": HVACAction.OFF.value,
+            # Stale/mismatched setpoint that WOULD cross the 0.5 threshold
+            "temperature": expected + 5.0,
+        }
+        hass.states.get = lambda eid: state if eid == REAL_CLIMATE_ID else MagicMock()
+        entity._on_real_climate_update()
+        assert entity._preset_mode == PRESET_HOME
+
 
 # ---------------------------------------------------------------------------
 # Unit tests – expected real target & mode-appropriate setpoints
