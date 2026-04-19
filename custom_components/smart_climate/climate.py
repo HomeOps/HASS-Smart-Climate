@@ -396,9 +396,12 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
         # Detect when the real device's temperature setpoint was changed
         # externally (e.g., via a physical remote) and exit preset mode.
+        # Skip when the real device is OFF: turning it off when the room is
+        # comfortable is normal AUTO operation, not an external change.
         if (
             self._hvac_mode == HVACMode.AUTO
             and self._preset_mode != PRESET_NONE
+            and state.state != HVACMode.OFF.value
         ):
             real_target = state.attributes.get("temperature")
             if real_target is not None:
