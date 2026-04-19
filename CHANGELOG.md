@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.2.0...v0.2.1) (2026-04-19)
+
+
+### Bug Fixes
+
+* keep preset when AUTO turns real device off ([#40](https://github.com/HomeOps/HASS-Smart-Climate/issues/40)) ([#41](https://github.com/HomeOps/HASS-Smart-Climate/issues/41)) ([8491a8a](https://github.com/HomeOps/HASS-Smart-Climate/commit/8491a8a5d2e5894880debfc4fbcee61879a375c6))
+
 ## [0.2.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.1.1...v0.2.0) (2026-04-18)
 
 
