@@ -204,7 +204,7 @@ class TestDesiredRealMode:
 class TestDesiredRealModeHysteresis:
     """Tests for the band-boundary and OFF behaviour in _desired_real_mode."""
 
-    def _entity(self, inside: float, last_mode: HVACMode | None = None, outside: float | None = None):
+    def _entity(self, inside: float, outside: float | None = None):
         hass = _make_hass_mock(inside_temp=inside, outside_temp=outside)
         config = {
             CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
@@ -217,47 +217,34 @@ class TestDesiredRealModeHysteresis:
         entity._preset_mode = PRESET_HOME
         entity._current_temperature = inside
         entity._outside_temperature = outside
-        entity._last_real_mode = last_mode
         return entity
 
-    def test_in_range_last_heat_returns_off(self):
-        """When inside is within the comfort band, return OFF regardless of last mode."""
+    def test_in_range_returns_off(self):
+        """When inside is within the comfort band, return OFF."""
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, last_mode=HVACMode.HEAT)
+        entity = self._entity(inside=mid)
         assert entity._desired_real_mode() == HVACMode.OFF
 
-    def test_in_range_last_cool_returns_off(self):
-        """When inside is within the comfort band, return OFF regardless of last mode."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, last_mode=HVACMode.COOL)
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_in_range_no_prior_mode_returns_off(self):
-        """No prior mode and in-band temperature → OFF."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, last_mode=None)
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_below_low_plus_deadband_heats_regardless_of_last_mode(self):
-        """At low + deadband (HEAT boundary) → always HEAT regardless of prior mode."""
-        entity = self._entity(inside=DEFAULT_HOME_MIN + INSIDE_DEADBAND, last_mode=HVACMode.COOL)
+    def test_below_low_plus_deadband_heats(self):
+        """At low + deadband (HEAT boundary) → HEAT."""
+        entity = self._entity(inside=DEFAULT_HOME_MIN + INSIDE_DEADBAND)
         assert entity._desired_real_mode() == HVACMode.HEAT
 
-    def test_below_low_always_heats_regardless_of_last_mode(self):
-        """Below low setpoint must always HEAT regardless of prior mode."""
-        entity = self._entity(inside=DEFAULT_HOME_MIN - 0.5, last_mode=HVACMode.COOL)
+    def test_below_low_heats(self):
+        """Below low setpoint → HEAT."""
+        entity = self._entity(inside=DEFAULT_HOME_MIN - 0.5)
         assert entity._desired_real_mode() == HVACMode.HEAT
 
-    def test_above_high_always_cools_regardless_of_last_mode(self):
-        """Above high setpoint must always COOL regardless of prior mode."""
-        entity = self._entity(inside=DEFAULT_HOME_MAX + 0.5, last_mode=HVACMode.HEAT)
+    def test_above_high_cools(self):
+        """Above high setpoint → COOL."""
+        entity = self._entity(inside=DEFAULT_HOME_MAX + 0.5)
         assert entity._desired_real_mode() == HVACMode.COOL
 
     def test_21_23_band_cools_at_22_5(self):
         """Issue regression: 21-23 band should switch to COOL at 22.5.
 
         high - INSIDE_DEADBAND = 23 - 0.5 = 22.5, so at 22.5 the system
-        should engage cooling even when last mode was HEAT.
+        should engage cooling.
         """
         hass = _make_hass_mock(inside_temp=22.5)
         config = {
@@ -270,7 +257,6 @@ class TestDesiredRealModeHysteresis:
         entity._target_temp_low = 21.0
         entity._target_temp_high = 23.0
         entity._current_temperature = 22.5
-        entity._last_real_mode = HVACMode.HEAT
         assert entity._desired_real_mode() == HVACMode.COOL
 
     def test_21_23_band_in_band_returns_off(self):
@@ -286,7 +272,6 @@ class TestDesiredRealModeHysteresis:
         entity._target_temp_low = 21.0
         entity._target_temp_high = 23.0
         entity._current_temperature = 22.4
-        entity._last_real_mode = HVACMode.HEAT
         assert entity._desired_real_mode() == HVACMode.OFF
 
     def test_21_23_band_heats_at_21_5(self):
@@ -309,11 +294,9 @@ class TestDesiredRealModeHysteresis:
         entity._current_temperature = 21.5
         assert entity._desired_real_mode() == HVACMode.HEAT
 
-    def test_at_high_minus_deadband_cools_regardless_of_last_heat(self):
-        """At high - deadband, COOL takes priority over prior HEAT."""
-        entity = self._entity(
-            inside=DEFAULT_HOME_MAX - INSIDE_DEADBAND, last_mode=HVACMode.HEAT
-        )
+    def test_at_high_minus_deadband_cools(self):
+        """At high - deadband (COOL boundary) → COOL."""
+        entity = self._entity(inside=DEFAULT_HOME_MAX - INSIDE_DEADBAND)
         assert entity._desired_real_mode() == HVACMode.COOL
 
 
@@ -633,61 +616,40 @@ class TestStateCallbacks:
         entity._on_real_climate_update()
         assert entity._hvac_action == HVACAction.HEATING
 
-    def test_external_real_temperature_change_exits_preset(self):
-        """When real device setpoint drifts far from expected target, go manual."""
-        entity, hass = self._entity_with_sensors()
-        # With last_real_mode=COOL the expected target is the high setpoint
-        entity._last_real_mode = HVACMode.COOL
-        expected = entity._expected_real_target()
-        state = MagicMock()
-        state.state = HVACMode.COOL.value
-        state.attributes = {
-            "hvac_action": HVACAction.COOLING.value,
-            "temperature": expected + 3.0,  # More than 0.5 away from expected
-        }
-        hass.states.get = lambda eid: state if eid == REAL_CLIMATE_ID else MagicMock()
-        entity._on_real_climate_update()
-        assert entity._preset_mode == PRESET_NONE
+    def test_real_setpoint_divergence_does_not_clear_preset(self):
+        """Master/slave: real-device state events never mutate preset_mode.
 
-    def test_external_change_stays_preset_when_target_matches(self):
-        """Real device at expected target should NOT exit preset mode."""
-        entity, hass = self._entity_with_sensors()
-        entity._last_real_mode = HVACMode.HEAT
-        expected = entity._expected_real_target()
-        state = MagicMock()
-        state.state = HVACMode.HEAT.value
-        state.attributes = {
-            "hvac_action": HVACAction.HEATING.value,
-            "temperature": expected,
-        }
-        hass.states.get = lambda eid: state if eid == REAL_CLIMATE_ID else MagicMock()
-        entity._on_real_climate_update()
-        assert entity._preset_mode == PRESET_HOME
-
-    def test_real_device_off_does_not_exit_preset(self):
-        """Real device transitioning to OFF (normal AUTO comfort-band behavior)
-        must not trigger external-change detection and clear the preset."""
-        entity, hass = self._entity_with_sensors()
-        entity._last_real_mode = HVACMode.COOL
-        expected = entity._expected_real_target()
-        state = MagicMock()
-        state.state = HVACMode.OFF.value
-        state.attributes = {
-            "hvac_action": HVACAction.OFF.value,
-            # Stale/mismatched setpoint that WOULD cross the 0.5 threshold
-            "temperature": expected + 5.0,
-        }
-        hass.states.get = lambda eid: state if eid == REAL_CLIMATE_ID else MagicMock()
-        entity._on_real_climate_update()
-        assert entity._preset_mode == PRESET_HOME
+        Smart climate is the sole writer of the real device's setpoint, so any
+        divergence reported back (in any hvac state, by any magnitude) must be
+        ignored by _on_real_climate_update.  This covers the whole class of
+        feedback-loop bugs where smart's own OFF / HEAT / COOL writes were
+        misread as external user overrides and wrongly dropped the preset.
+        """
+        for real_state, real_action, setpoint_offset in [
+            (HVACMode.OFF.value, HVACAction.OFF.value, 5.0),
+            (HVACMode.HEAT.value, HVACAction.HEATING.value, 10.0),
+            (HVACMode.COOL.value, HVACAction.COOLING.value, -10.0),
+        ]:
+            entity, hass = self._entity_with_sensors()
+            state = MagicMock()
+            state.state = real_state
+            state.attributes = {
+                "hvac_action": real_action,
+                "temperature": 22.0 + setpoint_offset,
+            }
+            hass.states.get = lambda eid, s=state: s if eid == REAL_CLIMATE_ID else MagicMock()
+            entity._on_real_climate_update()
+            assert entity._preset_mode == PRESET_HOME, (
+                f"preset wrongly cleared for real_state={real_state}"
+            )
 
 
 # ---------------------------------------------------------------------------
-# Unit tests – expected real target & mode-appropriate setpoints
+# Unit tests – mode-appropriate setpoints sent to the real device
 # ---------------------------------------------------------------------------
 
-class TestExpectedRealTarget:
-    """Tests for _expected_real_target – smooth temperature switching."""
+class TestSyncedSetpoints:
+    """Tests verifying _async_sync_real_climate sends the right setpoint."""
 
     def _entity(self, inside: float = 22.0, outside: float | None = None):
         hass = _make_hass_mock(inside_temp=inside, outside_temp=outside)
@@ -703,53 +665,6 @@ class TestExpectedRealTarget:
         entity._current_temperature = inside
         entity._outside_temperature = outside
         return entity
-
-    def test_heat_targets_low_setpoint(self):
-        """In AUTO+HEAT, real device should target low + INSIDE_DEADBAND."""
-        entity = self._entity()
-        entity._last_real_mode = HVACMode.HEAT
-        assert entity._expected_real_target() == DEFAULT_HOME_MIN + INSIDE_DEADBAND
-
-    def test_cool_targets_high_minus_one(self):
-        """In AUTO+COOL, real device should target high - 1 to avoid integer overshoot."""
-        entity = self._entity()
-        entity._last_real_mode = HVACMode.COOL
-        assert entity._expected_real_target() == DEFAULT_HOME_MAX - 1
-
-    def test_no_prior_mode_targets_midpoint(self):
-        """When no prior mode, fall back to midpoint."""
-        entity = self._entity()
-        entity._last_real_mode = None
-        expected_mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2.0
-        assert entity._expected_real_target() == pytest.approx(expected_mid)
-
-    def test_non_auto_mode_targets_single_setpoint(self):
-        """In HEAT/COOL single mode, target the stored single-point temp."""
-        entity = self._entity()
-        entity._hvac_mode = HVACMode.HEAT
-        entity._target_temperature = 23.0
-        assert entity._expected_real_target() == 23.0
-
-    def test_heat_to_cool_creates_dead_zone(self):
-        """Switching from HEAT to COOL jumps from low+deadband to high-1 target.
-
-        The gap between low+deadband and high-1 is the "dead zone" where the
-        real device is OFF and not actively heating or cooling.
-        Using high-1 (rather than high) prevents integer-only devices from
-        overshooting to high+0.5 and appearing to breach the upper band.
-        """
-        entity = self._entity()
-        entity._last_real_mode = HVACMode.HEAT
-        heat_target = entity._expected_real_target()
-
-        entity._last_real_mode = HVACMode.COOL
-        cool_target = entity._expected_real_target()
-
-        assert heat_target == DEFAULT_HOME_MIN + INSIDE_DEADBAND
-        assert cool_target == DEFAULT_HOME_MAX - 1
-        # Gap = (high - 1) - (low + deadband) = (high - low) - 1 - deadband
-        expected_gap = (DEFAULT_HOME_MAX - DEFAULT_HOME_MIN) - 1 - INSIDE_DEADBAND
-        assert cool_target - heat_target == expected_gap
 
     @pytest.mark.asyncio
     async def test_sync_sends_low_plus_deadband_when_heating(self):
@@ -854,15 +769,24 @@ class TestExpectedRealTarget:
         call_args = hass.services.async_call.call_args
         assert call_args[0][2]["temperature"] == high - 1  # 22, not 23
 
-    def test_cool_target_capped_at_low_for_narrow_band(self):
-        """Narrow band: cooling target must not drop below the low setpoint."""
-        entity = self._entity()
+    @pytest.mark.asyncio
+    async def test_sync_cool_target_capped_at_low_for_narrow_band(self):
+        """Narrow band: cooling target sent to real device must not drop below low."""
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.COOL.value,
+            real_climate_temp=None,
+            inside_temp=23.0,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.AUTO
         entity._preset_mode = PRESET_NONE
         entity._target_temp_low = 22.0
         entity._target_temp_high = 22.5  # only 0.5 °C wide
-        entity._last_real_mode = HVACMode.COOL
-        # high - 1 = 21.5 < low = 22.0, so result must be capped at low
-        assert entity._expected_real_target() == 22.0
+        entity._current_temperature = 23.0  # above high → COOL
+        await entity._async_sync_real_climate()
+        call_args = hass.services.async_call.call_args
+        # high - 1 = 21.5 < low = 22.0, so target must be capped at low
+        assert call_args[0][2]["temperature"] == 22.0
 
 
 # ---------------------------------------------------------------------------
@@ -1034,14 +958,14 @@ class TestStateRestoration:
         assert entity._preset_mode == PRESET_HOME
 
     @pytest.mark.asyncio
-    async def test_preset_not_reset_by_stale_real_device_temp(self):
-        """Preset must NOT be reset to NONE by a mismatched real device temp on startup.
+    async def test_preset_survives_mismatched_real_device_temp(self):
+        """Preset is restored verbatim regardless of real device's reported setpoint.
 
-        Before the fix, the real device's stale setpoint from before the
-        restart would trigger the external-change detection in
-        _on_real_climate_update, falsely resetting the preset to NONE.  By
-        subscribing to state changes *after* the initial sync, stale events
-        cannot fire during setup.
+        Smart climate owns preset_mode; real-device setpoint never feeds back
+        into it.  This test pins that contract end-to-end through startup:
+        even if the wrapped device reports a wildly divergent temperature
+        (e.g. stale value from before the restart), the restored preset is
+        unaffected.
         """
         last_state = self._make_last_state(
             hvac_mode=HVACMode.AUTO.value,
@@ -1049,50 +973,10 @@ class TestStateRestoration:
             target_temp_low=DEFAULT_SLEEP_MIN,
             target_temp_high=DEFAULT_SLEEP_MAX,
         )
-        # Real device has a very different temperature (stale from before restart)
         entity, hass = await self._setup_entity(
             last_state,
             inside_temp=20.0,
             real_climate_state=HVACMode.COOL.value,
-            real_climate_temp=25.0,  # Far from expected → would trigger false reset
+            real_climate_temp=25.0,  # wildly divergent setpoint
         )
-        # Preset must still be SLEEP, not reset to NONE
         assert entity._preset_mode == PRESET_SLEEP
-
-    @pytest.mark.asyncio
-    async def test_subscription_happens_after_sync(self):
-        """State-change subscription must occur after sync to prevent false resets."""
-        last_state = self._make_last_state(
-            hvac_mode=HVACMode.AUTO.value,
-            preset_mode=PRESET_AWAY,
-        )
-        hass = _make_hass_mock(
-            real_climate_state=HVACMode.OFF.value,
-            real_climate_temp=None,
-            inside_temp=20.0,
-        )
-        entity = _make_entity(hass)
-
-        call_order = []
-
-        with patch.object(
-            SmartClimateEntity, "async_get_last_state", return_value=last_state
-        ), patch.object(
-            SmartClimateEntity, "async_on_remove",
-            side_effect=lambda _: call_order.append("subscribe"),
-        ), patch(
-            "custom_components.smart_climate.climate.async_track_state_change_event",
-        ), patch.object(
-            SmartClimateEntity, "async_write_ha_state"
-        ), patch.object(
-            entity, "_async_sync_real_climate",
-            side_effect=lambda: call_order.append("sync"),
-        ):
-            await entity.async_added_to_hass()
-
-        # sync must come before subscribe
-        assert "sync" in call_order
-        assert "subscribe" in call_order
-        assert call_order.index("sync") < call_order.index("subscribe")
-        # Preset must remain intact after the full lifecycle
-        assert entity._preset_mode == PRESET_AWAY

@@ -89,6 +89,12 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
       - Sleep – cooler nighttime comfort range
       - Away  – wider range for unoccupied periods
       - None  – manual/direct control (no preset enforced)
+
+    Master/slave relationship with the real climate entity:
+    This entity is the sole writer of the wrapped device's hvac_mode and
+    temperature.  State-change events from the real device are used only to
+    mirror its hvac_action for UI display – they never feed back into the
+    authoritative state owned here (hvac_mode, preset_mode, setpoints).
     """
 
     _attr_has_entity_name = True
@@ -139,14 +145,9 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         self._outside_temperature: float | None = None
         self._hvac_action: HVACAction | None = None
 
-        # Guard flags – prevent feedback loops between control calls and state
-        # changes arriving from the real climate / sensors.
+        # Guard flag – skip sensor-triggered syncs while a control call is in
+        # flight so the two paths do not issue overlapping service calls.
         self._updating_from_control: bool = False
-        self._updating_from_real: bool = False
-
-        # Tracks the last HEAT/COOL mode sent to the real device; used by
-        # _desired_real_mode to apply hysteresis and avoid rapid cycling.
-        self._last_real_mode: HVACMode | None = None
 
         # Timestamp at which the inside temperature first entered the
         # comfortable mid-band zone (between low+deadband and high-deadband).
@@ -288,11 +289,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         if self._hvac_mode != HVACMode.OFF:
             await self._async_sync_real_climate()
 
-        # Subscribe to state changes on all tracked entities.  This is done
-        # *after* the initial sync so that stale state-change events from the
-        # real climate device (whose setpoint may not yet match the restored
-        # preset) do not trigger false "external change" detection and reset
-        # the preset to NONE.
+        # Subscribe to state changes on all tracked entities.
         entities_to_track = [self._real_climate_id, self._inside_sensor_id]
         if self._outside_sensor_id:
             entities_to_track.append(self._outside_sensor_id)
@@ -332,14 +329,6 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             except ValueError:
                 pass
 
-        # Seed _last_real_mode so hysteresis works correctly from the first update
-        try:
-            current_mode = HVACMode(state.state)
-            if current_mode in (HVACMode.HEAT, HVACMode.COOL):
-                self._last_real_mode = current_mode
-        except ValueError:
-            pass
-
     def _sync_from_sensors(self) -> None:
         """Pull current temperatures from the sensor entities at startup."""
         inside_state = self.hass.states.get(self._inside_sensor_id)
@@ -371,55 +360,29 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
     @callback
     def _on_real_climate_update(self) -> None:
-        """Handle state change of the wrapped climate device."""
-        if self._updating_from_control:
-            return
+        """Mirror the real device's hvac_action for UI display.
 
-        self._updating_from_real = True
-        needs_write = False
-
+        Smart climate is the authoritative source of truth for mode, preset,
+        and setpoints – see the master/slave note at the top of this class.
+        Real-device state-change events are used only to surface the current
+        action (heating / cooling / idle / off) in the frontend.
+        """
         state = self.hass.states.get(self._real_climate_id)
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            self._updating_from_real = False
             return
 
-        # Mirror the HVAC action (heating / cooling / idle / off …)
         action_str = state.attributes.get("hvac_action")
-        if action_str:
-            try:
-                new_action = HVACAction(action_str)
-                if self._hvac_action != new_action:
-                    self._hvac_action = new_action
-                    needs_write = True
-            except ValueError:
-                pass
+        if not action_str:
+            return
 
-        # Detect when the real device's temperature setpoint was changed
-        # externally (e.g., via a physical remote) and exit preset mode.
-        # Skip when the real device is OFF: turning it off when the room is
-        # comfortable is normal AUTO operation, not an external change.
-        if (
-            self._hvac_mode == HVACMode.AUTO
-            and self._preset_mode != PRESET_NONE
-            and state.state != HVACMode.OFF.value
-        ):
-            real_target = state.attributes.get("temperature")
-            if real_target is not None:
-                expected = self._expected_real_target()
-                if abs(float(real_target) - expected) > 0.5:
-                    _LOGGER.debug(
-                        "Real climate setpoint changed externally "
-                        "(expected %.1f, got %.1f) – switching to manual",
-                        expected,
-                        float(real_target),
-                    )
-                    self._preset_mode = PRESET_NONE
-                    needs_write = True
+        try:
+            new_action = HVACAction(action_str)
+        except ValueError:
+            return
 
-        if needs_write:
+        if self._hvac_action != new_action:
+            self._hvac_action = new_action
             self.async_write_ha_state()
-
-        self._updating_from_real = False
 
     @callback
     def _on_inside_sensor_update(self) -> None:
@@ -559,37 +522,12 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
     # Real-climate synchronisation
     # ------------------------------------------------------------------
 
-    def _expected_real_target(self) -> float:
-        """Return the temperature the real device should currently be set to.
-
-        In AUTO mode the target depends on whether we are heating or cooling:
-        HEAT targets low + INSIDE_DEADBAND so the real device's own internal
-        deadband causes it to start heating at approximately the configured low
-        setpoint.  COOL targets one below the high setpoint (high - 1) to
-        prevent real devices that only accept integer setpoints from
-        overshooting to high + 0.5 due to their own internal hysteresis.
-        The result is capped at low so it never falls below the heating target
-        for very narrow bands.
-        """
-        if self._hvac_mode != HVACMode.AUTO:
-            return self._target_temperature
-        low, high = self._active_range()
-        if self._last_real_mode == HVACMode.HEAT:
-            return low + INSIDE_DEADBAND
-        if self._last_real_mode == HVACMode.COOL:
-            return max(low, high - 1)
-        return self._preset_midpoint()
-
     async def _async_sync_real_climate(self) -> None:
         """Push the desired mode and setpoint to the real climate device."""
-        if self._updating_from_real or self._updating_from_control:
+        if self._updating_from_control:
             return
 
         real_mode = self._desired_real_mode()
-        # Track the decided HEAT/COOL mode so _expected_real_target can
-        # report what the device should be set to for external-change detection.
-        if real_mode in (HVACMode.HEAT, HVACMode.COOL):
-            self._last_real_mode = real_mode
 
         real_state = self.hass.states.get(self._real_climate_id)
         if real_state is None:
