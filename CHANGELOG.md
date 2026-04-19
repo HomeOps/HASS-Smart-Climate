@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.2.1...v1.0.0) (2026-04-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* Users whose wrapped climate device has a physical remote or knob will lose the automatic "drop out of preset when user overrides setpoint on the device" behavior. If that matters in your deployment, re-introduce the behavior explicitly (e.g. via an Automation on the real device''s state) rather than relying on implicit coupling.
+
+### Code Refactoring
+
+* make real climate a pure slave of smart climate ([#43](https://github.com/HomeOps/HASS-Smart-Climate/issues/43)) ([#44](https://github.com/HomeOps/HASS-Smart-Climate/issues/44)) ([e60d911](https://github.com/HomeOps/HASS-Smart-Climate/commit/e60d9114482a4ede34dc79e533ce2b4c3d0ea3cd))
+
 ## [0.2.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.2.0...v0.2.1) (2026-04-19)
 
 
