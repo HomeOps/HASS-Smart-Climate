@@ -155,6 +155,13 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # bias is only kept for this long before we force the device off.
         self._in_band_since: datetime.datetime | None = None
 
+        # Last HEAT/COOL/OFF decision pushed to the real device in AUTO mode.
+        # Used as the "previous state" input for mode hysteresis so that tiny
+        # inside-sensor jitter across the commit edge (high - DEADBAND or
+        # low + DEADBAND) does not flip the real device's mode on every
+        # sensor update.  None means no AUTO decision has been made yet.
+        self._last_real_mode: HVACMode | None = None
+
     # ------------------------------------------------------------------
     # ClimateEntity properties
     # ------------------------------------------------------------------
@@ -486,9 +493,28 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # COOL is checked first to avoid over-heating a near-target room.
         if inside >= high - INSIDE_DEADBAND:
             self._in_band_since = None  # exited the comfortable zone
+            self._last_real_mode = HVACMode.COOL
             return HVACMode.COOL
         if inside <= low + INSIDE_DEADBAND:
             self._in_band_since = None  # exited the comfortable zone
+            self._last_real_mode = HVACMode.HEAT
+            return HVACMode.HEAT
+
+        # In-band mode hysteresis.  The commit edges (high - DEADBAND and
+        # low + DEADBAND) have no hysteresis on their own: a sensor tick of
+        # ±0.01 °C across one of them bounces the decision between the
+        # committed mode and the in-band outside-bias below, and when the
+        # outside temperature is outside the band that bias returns the
+        # *opposite* mode — producing the observed COOL↔HEAT flapping at
+        # the band edge.  Stick with the previously-chosen mode until the
+        # inside temperature has travelled all the way to the comfort-band
+        # midpoint, i.e. only release the commit once the room has genuinely
+        # moved towards the other edge.  This is the mode-axis analogue of
+        # the setpoint resend loop that #46 / #47 fixed.
+        mid = (low + high) / 2.0
+        if self._last_real_mode == HVACMode.COOL and inside > mid:
+            return HVACMode.COOL
+        if self._last_real_mode == HVACMode.HEAT and inside < mid:
             return HVACMode.HEAT
 
         # Temperature is comfortably within the band.
@@ -510,12 +536,15 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             self._outside_temperature
         ):
             if self._outside_temperature < low:
+                self._last_real_mode = HVACMode.HEAT
                 return HVACMode.HEAT
             if self._outside_temperature > high:
+                self._last_real_mode = HVACMode.COOL
                 return HVACMode.COOL
 
         # No outside sensor, outside temp is within the comfort range, or the
         # inside temperature has been comfortable for too long – turn off.
+        self._last_real_mode = HVACMode.OFF
         return HVACMode.OFF
 
     # ------------------------------------------------------------------

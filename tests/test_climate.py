@@ -201,6 +201,108 @@ class TestDesiredRealMode:
         assert entity._desired_real_mode() == HVACMode.AUTO
 
 
+class TestBandEdgeModeHysteresis:
+    """Regression tests for mode flapping at the commit-edge (#49).
+
+    The commit thresholds `high - INSIDE_DEADBAND` / `low + INSIDE_DEADBAND`
+    are exact boundaries: a sensor tick of ±0.01 °C across one of them used
+    to flip the real device's mode on every update, and when the outside
+    temperature was outside the comfort band the in-band outside-bias
+    returned the *opposite* mode (COOL ↔ HEAT at max amplitude).  The
+    hysteresis rule added in this file keeps the previously-chosen mode
+    until the inside temperature has travelled all the way to the
+    comfort-band midpoint before reconsidering.
+    """
+
+    def _entity(self, inside: float, outside: float | None = None):
+        hass = _make_hass_mock(inside_temp=inside, outside_temp=outside)
+        config = {
+            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
+            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
+        }
+        if outside is not None:
+            config[CONF_OUTSIDE_SENSOR] = OUTSIDE_SENSOR_ID
+        entity = _make_entity(hass, config)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = inside
+        entity._outside_temperature = outside
+        return entity
+
+    def _set_inside(self, entity, inside):
+        entity._current_temperature = inside
+
+    def test_observed_flap_scenario_stays_cool(self):
+        """Exact #49 scenario: HOME preset, cold outside, inside jittering
+        across the upper commit edge (high - INSIDE_DEADBAND).
+
+        Without hysteresis the sequence produced COOL, HEAT, COOL, HEAT
+        (the outside-bias returns HEAT because outside < low).  With
+        hysteresis the mode commits to COOL on the first tick at the edge
+        and refuses to flip to HEAT until inside has dropped all the way to
+        the comfort-band midpoint.
+        """
+        edge = DEFAULT_HOME_MAX - INSIDE_DEADBAND  # 23.5 with defaults
+        entity = self._entity(inside=edge, outside=DEFAULT_HOME_MIN - 5)
+
+        assert entity._desired_real_mode() == HVACMode.COOL
+        self._set_inside(entity, edge - 0.01)
+        assert entity._desired_real_mode() == HVACMode.COOL
+        self._set_inside(entity, edge)
+        assert entity._desired_real_mode() == HVACMode.COOL
+        self._set_inside(entity, edge - 0.01)
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_symmetric_flap_at_low_edge_stays_heat(self):
+        """Mirror of the #49 scenario at the lower commit edge: hot outside,
+        inside jittering at low + INSIDE_DEADBAND — must stay HEAT."""
+        edge = DEFAULT_HOME_MIN + INSIDE_DEADBAND  # 21.5 with defaults
+        entity = self._entity(inside=edge, outside=DEFAULT_HOME_MAX + 5)
+
+        assert entity._desired_real_mode() == HVACMode.HEAT
+        self._set_inside(entity, edge + 0.01)
+        assert entity._desired_real_mode() == HVACMode.HEAT
+        self._set_inside(entity, edge)
+        assert entity._desired_real_mode() == HVACMode.HEAT
+        self._set_inside(entity, edge + 0.01)
+        assert entity._desired_real_mode() == HVACMode.HEAT
+
+    def test_cool_released_when_inside_drops_past_midpoint(self):
+        """After committing to COOL, a real excursion past the midpoint
+        releases hysteresis and the outside-bias can pick HEAT again."""
+        edge = DEFAULT_HOME_MAX - INSIDE_DEADBAND  # 23.5
+        entity = self._entity(inside=edge, outside=DEFAULT_HOME_MIN - 5)
+        assert entity._desired_real_mode() == HVACMode.COOL  # commits COOL
+
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        # Just past the midpoint towards the low edge — hysteresis releases.
+        self._set_inside(entity, mid - 0.01)
+        assert entity._desired_real_mode() == HVACMode.HEAT
+
+    def test_heat_released_when_inside_rises_past_midpoint(self):
+        """Symmetric release for a previously-HEAT decision."""
+        edge = DEFAULT_HOME_MIN + INSIDE_DEADBAND  # 21.5
+        entity = self._entity(inside=edge, outside=DEFAULT_HOME_MAX + 5)
+        assert entity._desired_real_mode() == HVACMode.HEAT  # commits HEAT
+
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2  # 22.0
+        self._set_inside(entity, mid + 0.01)
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_first_entry_without_prior_mode_uses_outside_bias(self):
+        """With no prior AUTO decision, in-band outside-bias logic is
+        unchanged — cold outside → HEAT, warm outside → COOL."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+
+        cold = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
+        assert cold._last_real_mode is None
+        assert cold._desired_real_mode() == HVACMode.HEAT
+
+        warm = self._entity(inside=mid, outside=DEFAULT_HOME_MAX + 5)
+        assert warm._last_real_mode is None
+        assert warm._desired_real_mode() == HVACMode.COOL
+
+
 class TestDesiredRealModeHysteresis:
     """Tests for the band-boundary and OFF behaviour in _desired_real_mode."""
 
