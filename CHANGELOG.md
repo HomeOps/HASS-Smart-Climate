@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v1.0.0...v1.0.1) (2026-04-20)
+
+
+### Bug Fixes
+
+* always send integer setpoint to real thermostat ([#46](https://github.com/HomeOps/HASS-Smart-Climate/issues/46)) ([#47](https://github.com/HomeOps/HASS-Smart-Climate/issues/47)) ([efe6a46](https://github.com/HomeOps/HASS-Smart-Climate/commit/efe6a466890452517074ef1d7cbf49cd5bdb8ad8))
+
 ## [1.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v0.2.1...v1.0.0) (2026-04-19)
 
 
