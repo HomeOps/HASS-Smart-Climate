@@ -31,13 +31,9 @@ TEMP_STEP = 0.5
 # Minimum allowed difference between low and high setpoints
 MIN_TEMP_DIFF = 0.5
 
-# Hysteresis deadband (°C) around the comfort-band midpoint used when the
-# inside temperature is already within the target range.  Without this buffer
-# any sensor jitter near the midpoint causes rapid HEAT ↔ COOL cycling.
+# Distance (°C) from each edge of the comfort band at which the real device
+# is committed to HEAT (at low + INSIDE_DEADBAND) or COOL (at high -
+# INSIDE_DEADBAND).  Inside this margin the device is kept OFF, and hysteresis
+# in _desired_real_mode stops the committed mode from flipping back to OFF on
+# sensor jitter across the commit edge.
 INSIDE_DEADBAND = 0.5
-
-# How long (seconds) the inside temperature must remain comfortably within the
-# comfort band while the outside-sensor logic would otherwise keep the real
-# device running before we force it off.  Prevents the HVAC from running
-# indefinitely when the room is already comfortable.
-STABLE_IN_BAND_TIMEOUT = 900  # 15 minutes
