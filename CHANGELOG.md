@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.2](https://github.com/HomeOps/HASS-Smart-Climate/compare/v1.0.1...v1.0.2) (2026-04-20)
+
+
+### Bug Fixes
+
+* hysteresis on AUTO mode-commit edge to stop real-device flapping ([#50](https://github.com/HomeOps/HASS-Smart-Climate/issues/50)) ([9137129](https://github.com/HomeOps/HASS-Smart-Climate/commit/913712957694da286ee3085f4032baa2bed7bd19))
+
 ## [1.0.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v1.0.0...v1.0.1) (2026-04-20)
 
 
