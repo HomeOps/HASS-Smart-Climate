@@ -668,10 +668,13 @@ class TestSyncedSetpoints:
 
     @pytest.mark.asyncio
     async def test_sync_sends_low_plus_deadband_when_heating(self):
-        """_async_sync_real_climate sends low + INSIDE_DEADBAND when in HEAT.
+        """_async_sync_real_climate targets low + INSIDE_DEADBAND when in HEAT.
 
-        This compensates for the real device's own internal deadband so it
-        starts heating at approximately the configured low setpoint.
+        The real device's own internal deadband then starts heating at
+        approximately the configured low setpoint.  The value is rounded up
+        to a whole integer because real thermostats only accept integer
+        setpoints and silently round anything else, which otherwise drives a
+        resend-every-sensor-update loop (see test_sync_heat_target_is_integer).
         """
         hass = _make_hass_mock(
             real_climate_state=HVACMode.HEAT.value,
@@ -687,7 +690,83 @@ class TestSyncedSetpoints:
         call_args = hass.services.async_call.call_args
         assert call_args[0][0] == "climate"
         assert call_args[0][1] == "set_temperature"
-        assert call_args[0][2]["temperature"] == DEFAULT_HOME_MIN + INSIDE_DEADBAND
+        assert call_args[0][2]["temperature"] == math.ceil(
+            DEFAULT_HOME_MIN + INSIDE_DEADBAND
+        )
+
+    @pytest.mark.asyncio
+    async def test_sync_heat_target_is_integer(self):
+        """Issue #46 regression: HEAT target must be a whole integer.
+
+        Real thermostats only accept integer setpoints.  Sending a
+        half-degree value like 21.5 is silently rounded to 21 by the device,
+        leaving current_temp != target_temp forever, which fires a fresh
+        set_temperature call on every inside-sensor update and manifests as
+        the setpoint fluttering between 21 and 21.5 in the UI.  We round up
+        for HEAT so the effective engagement point stays at low.
+        """
+        low, high = 21.0, 23.0
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.HEAT.value,
+            real_climate_temp=21,  # device rounded our previous 21.5 to 21
+            inside_temp=low - 1,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_NONE
+        entity._target_temp_low = low
+        entity._target_temp_high = high
+        entity._current_temperature = low - 1
+        await entity._async_sync_real_climate()
+        call_args = hass.services.async_call.call_args
+        sent = call_args[0][2]["temperature"]
+        assert sent == int(sent), f"expected integer target, got {sent}"
+        assert sent == 22  # ceil(21 + 0.5)
+
+    @pytest.mark.asyncio
+    async def test_sync_heat_no_resend_when_device_holds_integer_target(self):
+        """Once the integer target is stored by the device, no resend happens.
+
+        The previous behaviour sent 21.5, the device stored 21 (integer
+        rounding), and the ``temp_changed`` check (`abs(21 - 21.5) > 0.1`)
+        fired on every sensor update.  Rounding to an integer means the
+        device's reported setpoint matches what we sent, so sync returns
+        early and the flutter disappears.
+        """
+        low, high = 21.0, 23.0
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.HEAT.value,
+            real_climate_temp=22,  # matches what we now send (ceil(21.5))
+            inside_temp=low - 1,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_NONE
+        entity._target_temp_low = low
+        entity._target_temp_high = high
+        entity._current_temperature = low - 1
+        await entity._async_sync_real_climate()
+        hass.services.async_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sync_cool_target_is_integer(self):
+        """Mirror of the HEAT test — COOL target must also be a whole integer."""
+        low, high = 21.0, 23.0
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.COOL.value,
+            real_climate_temp=None,
+            inside_temp=high + 1,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_NONE
+        entity._target_temp_low = low
+        entity._target_temp_high = high
+        entity._current_temperature = high + 1
+        await entity._async_sync_real_climate()
+        call_args = hass.services.async_call.call_args
+        sent = call_args[0][2]["temperature"]
+        assert sent == int(sent), f"expected integer target, got {sent}"
 
     @pytest.mark.asyncio
     async def test_sync_sends_off_when_in_band(self):
