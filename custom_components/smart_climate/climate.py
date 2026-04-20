@@ -547,10 +547,11 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
                 )
             return
 
-        # In AUTO mode, target low + INSIDE_DEADBAND when heating so that the
-        # real device's own internal deadband causes it to start heating at
-        # approximately the configured low setpoint.  Target high - 1 when
-        # cooling to prevent integer-only devices from overshooting the band.
+        # In AUTO mode, target low + INSIDE_DEADBAND when heating so the real
+        # device's own internal deadband starts heating at approximately the
+        # configured low setpoint.  Target high - 1 when cooling to prevent
+        # overshooting the band.
+        low: float | None = None
         if self._hvac_mode == HVACMode.AUTO:
             low, high = self._active_range()
             if real_mode == HVACMode.HEAT:
@@ -560,10 +561,29 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         else:
             target_temp = self._target_temperature
 
+        # Real thermostats only accept whole-integer setpoints, and their
+        # advertised ``target_temp_step`` cannot be trusted to reflect that.
+        # Always round to an integer so the device stores exactly what we
+        # send — otherwise it silently rounds (e.g. 21.5 → 21) and every
+        # inside-sensor update drives another set_temperature call trying to
+        # "correct" the mismatch, producing the 21 ↔ 21.5 target flutter.
+        # Round directionally so engagement semantics survive: up for HEAT
+        # (keep heating at the low setpoint), down for COOL (keep cooling at
+        # the high setpoint).
+        if real_mode == HVACMode.HEAT:
+            target_temp = float(math.ceil(target_temp))
+        else:  # COOL
+            target_temp = float(math.floor(target_temp))
+            if low is not None:
+                target_temp = max(low, target_temp)
+
         current_temp = real_state.attributes.get("temperature")
 
+        # Tolerance must cover the full integer step so the next sensor
+        # update doesn't trigger a spurious resend when the device is
+        # already holding the exact value we sent.
         mode_changed = current_mode != real_mode.value
-        temp_changed = current_temp is None or abs(float(current_temp) - target_temp) > 0.1
+        temp_changed = current_temp is None or abs(float(current_temp) - target_temp) >= 0.5
 
         if not (mode_changed or temp_changed):
             return
