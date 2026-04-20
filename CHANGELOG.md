@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.3](https://github.com/HomeOps/HASS-Smart-Climate/compare/v1.0.2...v1.0.3) (2026-04-20)
+
+
+### Bug Fixes
+
+* return OFF in-band to stop overnight heat/cool cycling ([#52](https://github.com/HomeOps/HASS-Smart-Climate/issues/52)) ([38cda4f](https://github.com/HomeOps/HASS-Smart-Climate/commit/38cda4f75b909b5d9808335fc8b82dc2154c30eb))
+
 ## [1.0.2](https://github.com/HomeOps/HASS-Smart-Climate/compare/v1.0.1...v1.0.2) (2026-04-20)
 
 
