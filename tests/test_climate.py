@@ -1,7 +1,6 @@
 """Tests for the Smart Climate entity."""
 from __future__ import annotations
 
-import datetime
 import math
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
@@ -28,7 +27,6 @@ from custom_components.smart_climate.const import (
     DEFAULT_AWAY_MAX,
     INSIDE_DEADBAND,
     MIN_TEMP_DIFF,
-    STABLE_IN_BAND_TIMEOUT,
 )
 
 REAL_CLIMATE_ID = "climate.real_ac"
@@ -164,17 +162,23 @@ class TestDesiredRealMode:
         entity = self._entity(inside=mid)
         assert entity._desired_real_mode() == HVACMode.OFF
 
-    def test_auto_in_range_cold_outside_returns_heat(self):
-        """Inside temp in range, cold outside → HEAT to avoid off/heat cycling."""
+    def test_auto_in_range_cold_outside_returns_off(self):
+        """Inside temp in range, cold outside → OFF.
+
+        Regression for #52: the previous outside-sensor in-band bias returned
+        HEAT here, which combined with the commit-edge hysteresis (#49)
+        produced active HEAT↔COOL cycling across the whole band overnight.
+        The in-band decision is now OFF regardless of outside temperature.
+        """
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         entity = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
-        assert entity._desired_real_mode() == HVACMode.HEAT
+        assert entity._desired_real_mode() == HVACMode.OFF
 
-    def test_auto_in_range_warm_outside_returns_cool(self):
-        """Inside temp in range, warm outside → COOL to avoid off/cool cycling."""
+    def test_auto_in_range_warm_outside_returns_off(self):
+        """Inside temp in range, warm outside → OFF (see #52)."""
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         entity = self._entity(inside=mid, outside=DEFAULT_HOME_MAX + 5)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        assert entity._desired_real_mode() == HVACMode.OFF
 
     def test_auto_in_range_outside_in_range_returns_off(self):
         """Inside temp in range, outside also in range → OFF."""
@@ -206,12 +210,10 @@ class TestBandEdgeModeHysteresis:
 
     The commit thresholds `high - INSIDE_DEADBAND` / `low + INSIDE_DEADBAND`
     are exact boundaries: a sensor tick of ±0.01 °C across one of them used
-    to flip the real device's mode on every update, and when the outside
-    temperature was outside the comfort band the in-band outside-bias
-    returned the *opposite* mode (COOL ↔ HEAT at max amplitude).  The
-    hysteresis rule added in this file keeps the previously-chosen mode
-    until the inside temperature has travelled all the way to the
-    comfort-band midpoint before reconsidering.
+    to flip the real device's mode on every update (COOL ↔ OFF ↔ HEAT).
+    The hysteresis rule keeps the previously-chosen mode until the inside
+    temperature has travelled all the way to the comfort-band midpoint
+    before releasing to OFF.
     """
 
     def _entity(self, inside: float, outside: float | None = None):
@@ -233,17 +235,16 @@ class TestBandEdgeModeHysteresis:
         entity._current_temperature = inside
 
     def test_observed_flap_scenario_stays_cool(self):
-        """Exact #49 scenario: HOME preset, cold outside, inside jittering
-        across the upper commit edge (high - INSIDE_DEADBAND).
+        """Exact #49 scenario: HOME preset, inside jittering across the
+        upper commit edge (high - INSIDE_DEADBAND).
 
-        Without hysteresis the sequence produced COOL, HEAT, COOL, HEAT
-        (the outside-bias returns HEAT because outside < low).  With
-        hysteresis the mode commits to COOL on the first tick at the edge
-        and refuses to flip to HEAT until inside has dropped all the way to
-        the comfort-band midpoint.
+        Without hysteresis the sequence produced COOL, OFF, COOL, OFF on
+        every sensor tick.  With hysteresis the mode commits to COOL on
+        the first tick at the edge and refuses to release until inside has
+        dropped all the way to the comfort-band midpoint.
         """
         edge = DEFAULT_HOME_MAX - INSIDE_DEADBAND  # 23.5 with defaults
-        entity = self._entity(inside=edge, outside=DEFAULT_HOME_MIN - 5)
+        entity = self._entity(inside=edge)
 
         assert entity._desired_real_mode() == HVACMode.COOL
         self._set_inside(entity, edge - 0.01)
@@ -254,10 +255,10 @@ class TestBandEdgeModeHysteresis:
         assert entity._desired_real_mode() == HVACMode.COOL
 
     def test_symmetric_flap_at_low_edge_stays_heat(self):
-        """Mirror of the #49 scenario at the lower commit edge: hot outside,
-        inside jittering at low + INSIDE_DEADBAND — must stay HEAT."""
+        """Mirror of the #49 scenario at the lower commit edge: inside
+        jittering at low + INSIDE_DEADBAND — must stay HEAT."""
         edge = DEFAULT_HOME_MIN + INSIDE_DEADBAND  # 21.5 with defaults
-        entity = self._entity(inside=edge, outside=DEFAULT_HOME_MAX + 5)
+        entity = self._entity(inside=edge)
 
         assert entity._desired_real_mode() == HVACMode.HEAT
         self._set_inside(entity, edge + 0.01)
@@ -267,40 +268,44 @@ class TestBandEdgeModeHysteresis:
         self._set_inside(entity, edge + 0.01)
         assert entity._desired_real_mode() == HVACMode.HEAT
 
-    def test_cool_released_when_inside_drops_past_midpoint(self):
+    def test_cool_released_to_off_when_inside_drops_past_midpoint(self):
         """After committing to COOL, a real excursion past the midpoint
-        releases hysteresis and the outside-bias can pick HEAT again."""
+        releases hysteresis and the in-band decision is OFF (#52)."""
         edge = DEFAULT_HOME_MAX - INSIDE_DEADBAND  # 23.5
-        entity = self._entity(inside=edge, outside=DEFAULT_HOME_MIN - 5)
+        entity = self._entity(inside=edge)
         assert entity._desired_real_mode() == HVACMode.COOL  # commits COOL
 
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         # Just past the midpoint towards the low edge — hysteresis releases.
         self._set_inside(entity, mid - 0.01)
-        assert entity._desired_real_mode() == HVACMode.HEAT
+        assert entity._desired_real_mode() == HVACMode.OFF
 
-    def test_heat_released_when_inside_rises_past_midpoint(self):
-        """Symmetric release for a previously-HEAT decision."""
+    def test_heat_released_to_off_when_inside_rises_past_midpoint(self):
+        """Symmetric release for a previously-HEAT decision (#52)."""
         edge = DEFAULT_HOME_MIN + INSIDE_DEADBAND  # 21.5
-        entity = self._entity(inside=edge, outside=DEFAULT_HOME_MAX + 5)
+        entity = self._entity(inside=edge)
         assert entity._desired_real_mode() == HVACMode.HEAT  # commits HEAT
 
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2  # 22.0
         self._set_inside(entity, mid + 0.01)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        assert entity._desired_real_mode() == HVACMode.OFF
 
-    def test_first_entry_without_prior_mode_uses_outside_bias(self):
-        """With no prior AUTO decision, in-band outside-bias logic is
-        unchanged — cold outside → HEAT, warm outside → COOL."""
+    def test_first_entry_without_prior_mode_returns_off_in_band(self):
+        """With no prior AUTO decision and inside in the band, return OFF.
+
+        Regression for #52: previously this returned HEAT or COOL based on
+        the outside sensor, which combined with the hysteresis above
+        produced overnight active HEAT↔COOL cycling across the whole band.
+        """
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
 
         cold = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
         assert cold._last_real_mode is None
-        assert cold._desired_real_mode() == HVACMode.HEAT
+        assert cold._desired_real_mode() == HVACMode.OFF
 
         warm = self._entity(inside=mid, outside=DEFAULT_HOME_MAX + 5)
         assert warm._last_real_mode is None
-        assert warm._desired_real_mode() == HVACMode.COOL
+        assert warm._desired_real_mode() == HVACMode.OFF
 
 
 class TestDesiredRealModeHysteresis:
@@ -400,124 +405,6 @@ class TestDesiredRealModeHysteresis:
         """At high - deadband (COOL boundary) → COOL."""
         entity = self._entity(inside=DEFAULT_HOME_MAX - INSIDE_DEADBAND)
         assert entity._desired_real_mode() == HVACMode.COOL
-
-
-# ---------------------------------------------------------------------------
-# Unit tests – stable-in-band timeout (STABLE_IN_BAND_TIMEOUT)
-# ---------------------------------------------------------------------------
-
-class TestStableInBandTimeout:
-    """Tests for the 15-minute stable-in-band shut-off logic."""
-
-    def _entity(self, inside: float, outside: float | None = None):
-        hass = _make_hass_mock(inside_temp=inside, outside_temp=outside)
-        config = {
-            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
-            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
-        }
-        if outside is not None:
-            config[CONF_OUTSIDE_SENSOR] = OUTSIDE_SENSOR_ID
-        entity = _make_entity(hass, config)
-        entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_HOME
-        entity._current_temperature = inside
-        entity._outside_temperature = outside
-        return entity
-
-    def test_first_entry_cold_outside_returns_heat(self):
-        """On first entering the band with cold outside, return HEAT (timer not expired)."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
-        # _in_band_since is None → first entry
-        assert entity._in_band_since is None
-        assert entity._desired_real_mode() == HVACMode.HEAT
-        # Timer should now be set
-        assert entity._in_band_since is not None
-
-    def test_first_entry_warm_outside_returns_cool(self):
-        """On first entering the band with warm outside, return COOL (timer not expired)."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MAX + 5)
-        assert entity._desired_real_mode() == HVACMode.COOL
-        assert entity._in_band_since is not None
-
-    def test_after_timeout_cold_outside_returns_off(self):
-        """After STABLE_IN_BAND_TIMEOUT seconds in band, return OFF even with cold outside."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
-        # Simulate that we entered the band 15+ minutes ago
-        entity._in_band_since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-            seconds=STABLE_IN_BAND_TIMEOUT + 1
-        )
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_after_timeout_warm_outside_returns_off(self):
-        """After STABLE_IN_BAND_TIMEOUT seconds in band, return OFF even with warm outside."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MAX + 5)
-        entity._in_band_since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-            seconds=STABLE_IN_BAND_TIMEOUT + 1
-        )
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_just_before_timeout_still_heats(self):
-        """Just before timeout, HVAC should still keep running."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
-        entity._in_band_since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-            seconds=STABLE_IN_BAND_TIMEOUT - 60
-        )
-        assert entity._desired_real_mode() == HVACMode.HEAT
-
-    def test_timer_resets_when_temp_exits_band_low(self):
-        """Timer is cleared when temperature drops into the heating zone."""
-        entity = self._entity(inside=DEFAULT_HOME_MIN + INSIDE_DEADBAND - 0.1, outside=DEFAULT_HOME_MIN - 5)
-        entity._in_band_since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-            seconds=STABLE_IN_BAND_TIMEOUT + 1
-        )
-        # Temp is in the heating zone → HEAT, timer should be reset
-        result = entity._desired_real_mode()
-        assert result == HVACMode.HEAT
-        assert entity._in_band_since is None
-
-    def test_timer_resets_when_temp_exits_band_high(self):
-        """Timer is cleared when temperature rises into the cooling zone."""
-        entity = self._entity(inside=DEFAULT_HOME_MAX - INSIDE_DEADBAND + 0.1, outside=DEFAULT_HOME_MAX + 5)
-        entity._in_band_since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-            seconds=STABLE_IN_BAND_TIMEOUT + 1
-        )
-        result = entity._desired_real_mode()
-        assert result == HVACMode.COOL
-        assert entity._in_band_since is None
-
-    def test_after_band_exit_and_reentry_timer_restarted(self):
-        """Re-entering the band after an exit starts a fresh 15-minute timer."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
-
-        # Simulate expired timer
-        entity._in_band_since = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
-            seconds=STABLE_IN_BAND_TIMEOUT + 1
-        )
-        # Timed out → should return OFF
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-        # Now temp exits the band (clearly in heating zone)
-        entity._current_temperature = DEFAULT_HOME_MIN + INSIDE_DEADBAND - 0.1
-        entity._desired_real_mode()  # resets _in_band_since
-        assert entity._in_band_since is None
-
-        # Back in band – timer is fresh
-        entity._current_temperature = mid
-        result = entity._desired_real_mode()
-        assert result == HVACMode.HEAT  # fresh timer, should keep running
-        assert entity._in_band_since is not None
-
-    def test_no_outside_sensor_in_band_returns_off_immediately(self):
-        """Without outside sensor, in-band temperature returns OFF immediately (no timer needed)."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=None)
-        assert entity._desired_real_mode() == HVACMode.OFF
 
 
 # ---------------------------------------------------------------------------

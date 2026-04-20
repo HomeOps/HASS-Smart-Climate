@@ -8,7 +8,6 @@ Wraps a physical climate device and adds:
 """
 from __future__ import annotations
 
-import datetime
 import logging
 import math
 from typing import Any
@@ -54,7 +53,6 @@ from .const import (
     MAX_TEMP,
     MIN_TEMP,
     MIN_TEMP_DIFF,
-    STABLE_IN_BAND_TIMEOUT,
     TEMP_STEP,
 )
 
@@ -148,12 +146,6 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # Guard flag – skip sensor-triggered syncs while a control call is in
         # flight so the two paths do not issue overlapping service calls.
         self._updating_from_control: bool = False
-
-        # Timestamp at which the inside temperature first entered the
-        # comfortable mid-band zone (between low+deadband and high-deadband).
-        # Used to enforce STABLE_IN_BAND_TIMEOUT: the outside-sensor HEAT/COOL
-        # bias is only kept for this long before we force the device off.
-        self._in_band_since: datetime.datetime | None = None
 
         # Last HEAT/COOL/OFF decision pushed to the real device in AUTO mode.
         # Used as the "previous state" input for mode hysteresis so that tiny
@@ -492,58 +484,34 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # For sub-1 °C bands the device will be either HEAT or COOL (never OFF);
         # COOL is checked first to avoid over-heating a near-target room.
         if inside >= high - INSIDE_DEADBAND:
-            self._in_band_since = None  # exited the comfortable zone
             self._last_real_mode = HVACMode.COOL
             return HVACMode.COOL
         if inside <= low + INSIDE_DEADBAND:
-            self._in_band_since = None  # exited the comfortable zone
             self._last_real_mode = HVACMode.HEAT
             return HVACMode.HEAT
 
         # In-band mode hysteresis.  The commit edges (high - DEADBAND and
         # low + DEADBAND) have no hysteresis on their own: a sensor tick of
-        # ±0.01 °C across one of them bounces the decision between the
-        # committed mode and the in-band outside-bias below, and when the
-        # outside temperature is outside the band that bias returns the
-        # *opposite* mode — producing the observed COOL↔HEAT flapping at
-        # the band edge.  Stick with the previously-chosen mode until the
-        # inside temperature has travelled all the way to the comfort-band
-        # midpoint, i.e. only release the commit once the room has genuinely
-        # moved towards the other edge.  This is the mode-axis analogue of
-        # the setpoint resend loop that #46 / #47 fixed.
+        # ±0.01 °C across one of them would bounce the decision between the
+        # committed mode and the in-band OFF below.  Stick with the
+        # previously-chosen HEAT or COOL commitment until the inside
+        # temperature has travelled to the comfort-band midpoint, i.e. only
+        # release the commit once the room has genuinely moved towards the
+        # other edge.  Mode-axis analogue of the setpoint resend loop that
+        # #46 / #47 fixed.
         mid = (low + high) / 2.0
         if self._last_real_mode == HVACMode.COOL and inside > mid:
             return HVACMode.COOL
         if self._last_real_mode == HVACMode.HEAT and inside < mid:
             return HVACMode.HEAT
 
-        # Temperature is comfortably within the band.
-        # Record when we first entered this comfortable state so we can enforce
-        # a maximum run time for the outside-sensor HEAT/COOL bias.
-        now = datetime.datetime.now(datetime.timezone.utc)
-        if self._in_band_since is None:
-            self._in_band_since = now
-
-        # Use the outside sensor to decide whether to maintain HEAT or COOL
-        # instead of turning the device off.  This avoids rapid off/heat/off
-        # (winter) or off/cool/off (summer) cycling when the inside temp
-        # fluctuates near the midpoint of the comfort range.
-        # However, if the temperature has been stable in the band for longer
-        # than STABLE_IN_BAND_TIMEOUT, the room is genuinely comfortable and
-        # continuing to run the HVAC wastes energy – turn it off regardless.
-        elapsed = (now - self._in_band_since).total_seconds()
-        if elapsed < STABLE_IN_BAND_TIMEOUT and self._outside_temperature is not None and not math.isnan(
-            self._outside_temperature
-        ):
-            if self._outside_temperature < low:
-                self._last_real_mode = HVACMode.HEAT
-                return HVACMode.HEAT
-            if self._outside_temperature > high:
-                self._last_real_mode = HVACMode.COOL
-                return HVACMode.COOL
-
-        # No outside sensor, outside temp is within the comfort range, or the
-        # inside temperature has been comfortable for too long – turn off.
+        # Temperature is comfortably within the band → turn the real device
+        # off.  The previous outside-sensor in-band bias (PR #35) was
+        # removed in PR #52: combined with the hysteresis above it produced
+        # large active HEAT↔COOL swings across the whole band (#52), which
+        # is worse than the rapid off/heat/off flutter that #35 was trying
+        # to suppress.  With the commit hysteresis in place, OFF in-band is
+        # both simpler and kinder to the HVAC.
         self._last_real_mode = HVACMode.OFF
         return HVACMode.OFF
 
