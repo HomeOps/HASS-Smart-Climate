@@ -94,18 +94,39 @@ All tests are in `tests/` and must be kept in sync with implementation changes.
 ### Temperature Management
 
 - Temperatures are stored as floats (°C)
-- `TEMP_STEP`: 0.1 °C granularity for setpoint adjustments
-- `MIN_TEMP`/`MAX_TEMP`: Absolute bounds (16–32 °C)
-- `INSIDE_DEADBAND`: 0.5 °C hysteresis to avoid switching oscillation
+- `TEMP_STEP`: 0.5 °C granularity for setpoint adjustments
+- `MIN_TEMP`/`MAX_TEMP`: Absolute bounds (10–35 °C)
 - `MIN_TEMP_DIFF`: 0.5 °C minimum difference between low and high setpoints
+- `FLIP_MARGIN` / `FLIP_DWELL`: how far past the comfort-band midpoint
+  (in °C) and for how long (in seconds, default 30 min) the inside
+  temperature must persist *against* the committed AUTO mode before
+  HEAT↔COOL flips.
 
-### AUTO Mode Logic
+### AUTO Mode Logic — sticky-mode for modulating real devices
 
-1. If `inside_temp < low_setpoint` → switch real device to **HEAT**
-2. If `inside_temp > high_setpoint` → switch real device to **COOL**
-3. If `inside_temp` is within range:
-   - **With outside sensor**: use outside temperature to decide (warm → cool, cold → heat)
-   - **Without outside sensor**: use midpoint (above → cool, below → heat)
+The wrapper picks HEAT or COOL **once** per AUTO entry and holds it; the
+real device's setpoint is the comfort-band midpoint (rounded directionally
+to a whole integer — up for HEAT, down for COOL — and clamped into the
+band).  The (modulating) real device is left to settle on the midpoint at
+low compressor modulation rather than being repeatedly start/stop cycled.
+Real device is **never** commanded OFF in AUTO.
+
+1. **Initial pick** (when no committed mode yet, e.g. AUTO entered fresh
+   or after HA restart):
+   - With outside sensor: outside < midpoint → HEAT, otherwise COOL.
+   - Without outside sensor: inside < midpoint → HEAT, otherwise COOL.
+   - Tie at midpoint with no outside sensor → COOL.
+2. **Sticky hold**: the committed mode is kept regardless of where inside
+   sits.  The Midea inverter holds the midpoint via its own modulation.
+3. **Flip rule**: HEAT↔COOL only flips when inside has been continuously
+   past the midpoint by `FLIP_MARGIN` *against* the committed mode for
+   `FLIP_DWELL` seconds.  The dwell timer is reset only when inside
+   crosses fully back to the correct half of the band; the dead-zone in
+   between (e.g. for COOL: `mid - FLIP_MARGIN < inside < mid`) keeps the
+   timer running so jitter near the threshold doesn't repeatedly cancel
+   an in-progress flip.
+4. **Leaving AUTO** (to OFF, HEAT, or COOL) clears the commitment and
+   the dwell timer; re-entering AUTO re-picks fresh.
 
 ### Preset System
 
@@ -192,8 +213,10 @@ rm -rf .pytest_cache __pycache__ .coverage
 - Tests are comprehensive — always run them before reporting a task complete
 - Avoid breaking preset or state restoration behavior (very sensitive areas)
 - Temperature calculations must maintain numeric precision (use TEMP_STEP consistently)
-- The real climate device's setpoint is always the preset midpoint (critical invariant)
-- External setpoint changes > INSIDE_DEADBAND force Manual mode (prevents conflicts)
+- The real climate device's setpoint in AUTO is the preset midpoint (critical invariant)
+- Master/slave (since #43): smart climate is the sole writer of the real device's
+  hvac_mode and setpoint; real-device state events are only mirrored as
+  `hvac_action` for UI and never feed back into preset/setpoint state
 - All preset temperature ranges must respect MIN_TEMP_DIFF constraint
 
 ## References

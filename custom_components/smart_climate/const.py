@@ -31,9 +31,14 @@ TEMP_STEP = 0.5
 # Minimum allowed difference between low and high setpoints
 MIN_TEMP_DIFF = 0.5
 
-# Distance (°C) from each edge of the comfort band at which the real device
-# is committed to HEAT (at low + INSIDE_DEADBAND) or COOL (at high -
-# INSIDE_DEADBAND).  Inside this margin the device is kept OFF, and hysteresis
-# in _desired_real_mode stops the committed mode from flipping back to OFF on
-# sensor jitter across the commit edge.
-INSIDE_DEADBAND = 0.5
+# AUTO mode picks HEAT or COOL once and holds it; the real device's setpoint
+# is the comfort-band midpoint and the (modulating) device is left to settle
+# on it.  HEAT↔COOL flips only when the inside temperature has been
+# continuously past the midpoint by FLIP_MARGIN for FLIP_DWELL seconds —
+# i.e. the room is asking for the opposite mode, not just jittering across
+# the boundary.  This is sized for inverter heat pumps where the cost of
+# restarting the compressor far exceeds the energy of holding low
+# modulation, and where short OFF cycles defeat the unit's own steady-state
+# operation.
+FLIP_MARGIN = 0.5
+FLIP_DWELL = 1800  # 30 min
