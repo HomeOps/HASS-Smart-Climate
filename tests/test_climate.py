@@ -1,6 +1,7 @@
 """Tests for the Smart Climate entity."""
 from __future__ import annotations
 
+import datetime
 import math
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
@@ -25,9 +26,27 @@ from custom_components.smart_climate.const import (
     DEFAULT_SLEEP_MAX,
     DEFAULT_AWAY_MIN,
     DEFAULT_AWAY_MAX,
-    INSIDE_DEADBAND,
+    FLIP_DWELL,
+    FLIP_MARGIN,
     MIN_TEMP_DIFF,
 )
+
+
+def _fake_clock(start: datetime.datetime | None = None):
+    """Return (now_callable, advance_callable) over a mutable fake clock.
+
+    Use as ``entity._now = now`` to drive the AUTO flip-dwell timer in
+    deterministic test steps, advancing time with ``advance(seconds)``.
+    """
+    state = {"t": start or datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)}
+
+    def now() -> datetime.datetime:
+        return state["t"]
+
+    def advance(seconds: float) -> None:
+        state["t"] = state["t"] + datetime.timedelta(seconds=seconds)
+
+    return now, advance
 
 REAL_CLIMATE_ID = "climate.real_ac"
 INSIDE_SENSOR_ID = "sensor.inside_temp"
@@ -90,11 +109,11 @@ def _make_hass_mock(
 
 
 # ---------------------------------------------------------------------------
-# Unit tests – _desired_real_mode
+# Unit tests – _desired_real_mode (sticky AUTO mode)
 # ---------------------------------------------------------------------------
 
 class TestDesiredRealMode:
-    """Tests for the internal mode-selection logic."""
+    """Pass-through and initial-pick behaviour of _desired_real_mode."""
 
     def _entity(self, inside: float | None, outside: float | None = None):
         hass = _make_hass_mock(inside_temp=inside, outside_temp=outside)
@@ -126,285 +145,257 @@ class TestDesiredRealMode:
         entity._hvac_mode = HVACMode.COOL
         assert entity._desired_real_mode() == HVACMode.COOL
 
-    def test_auto_below_low_returns_heat(self):
-        """Inside temp below the low setpoint → HEAT."""
+    def test_auto_no_inside_sensor_no_prior_choice_returns_auto(self):
+        """Without a sensor reading and no committed mode yet, return AUTO
+        so the real device is left untouched until we actually know."""
+        entity = self._entity(inside=None)
+        entity._current_temperature = None
+        assert entity._auto_mode is None
+        assert entity._desired_real_mode() == HVACMode.AUTO
+
+    def test_auto_no_inside_sensor_keeps_committed_mode(self):
+        """If a mode was already chosen, a transient sensor outage must not
+        drop the commitment back to bare AUTO."""
+        entity = self._entity(inside=None)
+        entity._current_temperature = None
+        entity._auto_mode = HVACMode.COOL
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_initial_pick_uses_outside_when_cold(self):
+        """Outside sensor decides the first commitment: cold → HEAT."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
+        assert entity._desired_real_mode() == HVACMode.HEAT
+        assert entity._auto_mode == HVACMode.HEAT
+
+    def test_initial_pick_uses_outside_when_warm(self):
+        """Outside sensor decides the first commitment: warm → COOL."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MAX + 5)
+        assert entity._desired_real_mode() == HVACMode.COOL
+        assert entity._auto_mode == HVACMode.COOL
+
+    def test_initial_pick_falls_back_to_inside_when_no_outside(self):
+        """No outside sensor: inside-vs-midpoint chooses initial mode."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        cold = self._entity(inside=mid - 1.0)
+        assert cold._desired_real_mode() == HVACMode.HEAT
+        warm = self._entity(inside=mid + 1.0)
+        assert warm._desired_real_mode() == HVACMode.COOL
+
+    def test_initial_pick_at_midpoint_breaks_to_cool(self):
+        """Tie at exactly the midpoint with no outside sensor → COOL."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid)
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_auto_below_low_picks_heat(self):
+        """Way below the band — initial pick is HEAT (inside fallback)."""
         entity = self._entity(inside=DEFAULT_HOME_MIN - 1)
         assert entity._desired_real_mode() == HVACMode.HEAT
 
-    def test_auto_at_low_plus_deadband_returns_heat(self):
-        """Inside temp exactly at low + deadband → HEAT (boundary of heat zone)."""
-        entity = self._entity(inside=DEFAULT_HOME_MIN + INSIDE_DEADBAND)
-        assert entity._desired_real_mode() == HVACMode.HEAT
-
-    def test_auto_just_above_low_plus_deadband_returns_off(self):
-        """Inside temp just above low + deadband → OFF (entered comfort band)."""
-        entity = self._entity(inside=DEFAULT_HOME_MIN + INSIDE_DEADBAND + 0.1)
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_auto_above_high_returns_cool(self):
-        """Inside temp above the high setpoint → COOL."""
+    def test_auto_above_high_picks_cool(self):
+        """Way above the band — initial pick is COOL."""
         entity = self._entity(inside=DEFAULT_HOME_MAX + 1)
         assert entity._desired_real_mode() == HVACMode.COOL
 
-    def test_auto_at_high_minus_deadband_returns_cool(self):
-        """Inside temp at high - deadband → COOL (engage cooling early)."""
-        entity = self._entity(inside=DEFAULT_HOME_MAX - INSIDE_DEADBAND)
-        assert entity._desired_real_mode() == HVACMode.COOL
-
-    def test_auto_just_below_high_minus_deadband_returns_off(self):
-        """Inside temp just below high - deadband → OFF (in comfort band)."""
-        entity = self._entity(inside=DEFAULT_HOME_MAX - INSIDE_DEADBAND - 0.1)
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_auto_in_range_returns_off(self):
-        """Inside temp in the comfort band → real device OFF."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid)
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_auto_in_range_cold_outside_returns_off(self):
-        """Inside temp in range, cold outside → OFF.
-
-        Regression for #52: the previous outside-sensor in-band bias returned
-        HEAT here, which combined with the commit-edge hysteresis (#49)
-        produced active HEAT↔COOL cycling across the whole band overnight.
-        The in-band decision is now OFF regardless of outside temperature.
-        """
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_auto_in_range_warm_outside_returns_off(self):
-        """Inside temp in range, warm outside → OFF (see #52)."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MAX + 5)
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_auto_in_range_outside_in_range_returns_off(self):
-        """Inside temp in range, outside also in range → OFF."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=mid)
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_auto_in_range_no_outside_sensor_below_mid_returns_off(self):
-        """No outside sensor, inside below midpoint but in band → OFF."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid - 0.1)
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_auto_in_range_no_outside_sensor_above_mid_returns_off(self):
-        """No outside sensor, inside above midpoint but in band → OFF."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid + 0.1)
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_auto_no_inside_sensor_returns_auto(self):
-        """No inside sensor reading → keep AUTO (don't flip the device)."""
-        entity = self._entity(inside=None)
-        entity._current_temperature = None
-        assert entity._desired_real_mode() == HVACMode.AUTO
+    def test_auto_never_returns_off(self):
+        """Smoke test: across a sweep of inside temps in AUTO, OFF is never
+        returned regardless of starting commitment."""
+        for inside in [
+            DEFAULT_HOME_MIN - 5,
+            DEFAULT_HOME_MIN,
+            (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2,
+            DEFAULT_HOME_MAX,
+            DEFAULT_HOME_MAX + 5,
+        ]:
+            for prior in (None, HVACMode.HEAT, HVACMode.COOL):
+                entity = self._entity(inside=inside)
+                entity._auto_mode = prior
+                assert entity._desired_real_mode() != HVACMode.OFF
 
 
-class TestBandEdgeModeHysteresis:
-    """Regression tests for mode flapping at the commit-edge (#49).
-
-    The commit thresholds `high - INSIDE_DEADBAND` / `low + INSIDE_DEADBAND`
-    are exact boundaries: a sensor tick of ±0.01 °C across one of them used
-    to flip the real device's mode on every update (COOL ↔ OFF ↔ HEAT).
-    The hysteresis rule keeps the previously-chosen mode until the inside
-    temperature has travelled all the way to the comfort-band midpoint
-    before releasing to OFF.
+class TestStickyAutoMode:
+    """Sticky-mode behaviour: a committed HEAT/COOL choice survives jitter
+    and only flips after FLIP_DWELL seconds continuously past the midpoint
+    by FLIP_MARGIN against the committed mode (the room is asking for the
+    opposite mode, not just sitting near the boundary).
     """
 
-    def _entity(self, inside: float, outside: float | None = None):
-        hass = _make_hass_mock(inside_temp=inside, outside_temp=outside)
+    def _entity(self, inside: float, committed: HVACMode):
+        hass = _make_hass_mock(inside_temp=inside)
         config = {
             CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
             CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
         }
-        if outside is not None:
-            config[CONF_OUTSIDE_SENSOR] = OUTSIDE_SENSOR_ID
         entity = _make_entity(hass, config)
         entity._hvac_mode = HVACMode.AUTO
         entity._preset_mode = PRESET_HOME
         entity._current_temperature = inside
-        entity._outside_temperature = outside
+        entity._auto_mode = committed
+        entity._pending_flip_since = None
+        now, _ = _fake_clock()
+        entity._now = now
         return entity
 
-    def _set_inside(self, entity, inside):
+    def _set(self, entity, inside):
         entity._current_temperature = inside
 
-    def test_observed_flap_scenario_stays_cool(self):
-        """Exact #49 scenario: HOME preset, inside jittering across the
-        upper commit edge (high - INSIDE_DEADBAND).
-
-        Without hysteresis the sequence produced COOL, OFF, COOL, OFF on
-        every sensor tick.  With hysteresis the mode commits to COOL on
-        the first tick at the edge and refuses to release until inside has
-        dropped all the way to the comfort-band midpoint.
-        """
-        edge = DEFAULT_HOME_MAX - INSIDE_DEADBAND  # 23.5 with defaults
-        entity = self._entity(inside=edge)
-
-        assert entity._desired_real_mode() == HVACMode.COOL
-        self._set_inside(entity, edge - 0.01)
-        assert entity._desired_real_mode() == HVACMode.COOL
-        self._set_inside(entity, edge)
-        assert entity._desired_real_mode() == HVACMode.COOL
-        self._set_inside(entity, edge - 0.01)
-        assert entity._desired_real_mode() == HVACMode.COOL
-
-    def test_symmetric_flap_at_low_edge_stays_heat(self):
-        """Mirror of the #49 scenario at the lower commit edge: inside
-        jittering at low + INSIDE_DEADBAND — must stay HEAT."""
-        edge = DEFAULT_HOME_MIN + INSIDE_DEADBAND  # 21.5 with defaults
-        entity = self._entity(inside=edge)
-
-        assert entity._desired_real_mode() == HVACMode.HEAT
-        self._set_inside(entity, edge + 0.01)
-        assert entity._desired_real_mode() == HVACMode.HEAT
-        self._set_inside(entity, edge)
-        assert entity._desired_real_mode() == HVACMode.HEAT
-        self._set_inside(entity, edge + 0.01)
-        assert entity._desired_real_mode() == HVACMode.HEAT
-
-    def test_cool_released_to_off_when_inside_drops_past_midpoint(self):
-        """After committing to COOL, a real excursion past the midpoint
-        releases hysteresis and the in-band decision is OFF (#52)."""
-        edge = DEFAULT_HOME_MAX - INSIDE_DEADBAND  # 23.5
-        entity = self._entity(inside=edge)
-        assert entity._desired_real_mode() == HVACMode.COOL  # commits COOL
-
+    def test_cool_stays_cool_above_midpoint(self):
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        # Just past the midpoint towards the low edge — hysteresis releases.
-        self._set_inside(entity, mid - 0.01)
-        assert entity._desired_real_mode() == HVACMode.OFF
+        entity = self._entity(inside=mid + 0.5, committed=HVACMode.COOL)
+        assert entity._desired_real_mode() == HVACMode.COOL
 
-    def test_heat_released_to_off_when_inside_rises_past_midpoint(self):
-        """Symmetric release for a previously-HEAT decision (#52)."""
-        edge = DEFAULT_HOME_MIN + INSIDE_DEADBAND  # 21.5
-        entity = self._entity(inside=edge)
-        assert entity._desired_real_mode() == HVACMode.HEAT  # commits HEAT
-
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2  # 22.0
-        self._set_inside(entity, mid + 0.01)
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_first_entry_without_prior_mode_returns_off_in_band(self):
-        """With no prior AUTO decision and inside in the band, return OFF.
-
-        Regression for #52: previously this returned HEAT or COOL based on
-        the outside sensor, which combined with the hysteresis above
-        produced overnight active HEAT↔COOL cycling across the whole band.
-        """
+    def test_heat_stays_heat_below_midpoint(self):
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid - 0.5, committed=HVACMode.HEAT)
+        assert entity._desired_real_mode() == HVACMode.HEAT
 
-        cold = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
-        assert cold._last_real_mode is None
-        assert cold._desired_real_mode() == HVACMode.OFF
+    def test_cool_survives_jitter_above_low_edge(self):
+        """COOL committed; inside jittering at the low band edge does not
+        flip mode (this is the wrong-side dead-zone before FLIP_MARGIN)."""
+        low, high = DEFAULT_HOME_MIN, DEFAULT_HOME_MAX
+        mid = (low + high) / 2
+        # mid - FLIP_MARGIN is the wrong-side threshold.  Sit just inside
+        # it — i.e. still on the right side / dead-zone boundary.
+        entity = self._entity(inside=mid - FLIP_MARGIN + 0.01, committed=HVACMode.COOL)
+        for _ in range(5):
+            assert entity._desired_real_mode() == HVACMode.COOL
 
-        warm = self._entity(inside=mid, outside=DEFAULT_HOME_MAX + 5)
-        assert warm._last_real_mode is None
-        assert warm._desired_real_mode() == HVACMode.OFF
+    def test_cool_does_not_flip_briefly_past_margin(self):
+        """COOL committed; a few sensor ticks past the wrong-side margin
+        do not commit the flip — only sustained dwell does."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid - FLIP_MARGIN - 0.1, committed=HVACMode.COOL)
+        now, advance = _fake_clock()
+        entity._now = now
+        # First tick: starts the dwell timer.
+        assert entity._desired_real_mode() == HVACMode.COOL
+        assert entity._pending_flip_since is not None
+        # Just under the dwell threshold: still COOL.
+        advance(FLIP_DWELL - 1)
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_cool_flips_to_heat_after_dwell(self):
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid - FLIP_MARGIN - 0.1, committed=HVACMode.COOL)
+        now, advance = _fake_clock()
+        entity._now = now
+        assert entity._desired_real_mode() == HVACMode.COOL  # arms timer
+        advance(FLIP_DWELL)
+        assert entity._desired_real_mode() == HVACMode.HEAT
+        assert entity._auto_mode == HVACMode.HEAT
+        assert entity._pending_flip_since is None
+
+    def test_heat_flips_to_cool_after_dwell(self):
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid + FLIP_MARGIN + 0.1, committed=HVACMode.HEAT)
+        now, advance = _fake_clock()
+        entity._now = now
+        assert entity._desired_real_mode() == HVACMode.HEAT
+        advance(FLIP_DWELL)
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_dwell_resets_on_full_crossback_to_correct_side(self):
+        """COOL committed, inside drops below the wrong-side margin then
+        bounces all the way back past the midpoint: dwell timer must reset
+        so a later excursion needs a fresh full FLIP_DWELL window."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid - FLIP_MARGIN - 0.1, committed=HVACMode.COOL)
+        now, advance = _fake_clock()
+        entity._now = now
+        assert entity._desired_real_mode() == HVACMode.COOL
+        assert entity._pending_flip_since is not None
+
+        # Cross back fully to the correct (above-midpoint) side.
+        advance(60)
+        self._set(entity, mid + 0.5)
+        assert entity._desired_real_mode() == HVACMode.COOL
+        assert entity._pending_flip_since is None
+
+        # Now drop below margin again — timer must restart from now,
+        # a near-full-dwell wait must NOT flip.
+        advance(60)
+        self._set(entity, mid - FLIP_MARGIN - 0.1)
+        assert entity._desired_real_mode() == HVACMode.COOL
+        advance(FLIP_DWELL - 1)
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_dwell_keeps_running_in_deadzone(self):
+        """If inside drops past margin (arms timer) then drifts up into the
+        dead-zone (still on wrong half but not past margin), the timer
+        must keep running — only a full crossback past midpoint resets."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid - FLIP_MARGIN - 0.1, committed=HVACMode.COOL)
+        now, advance = _fake_clock()
+        entity._now = now
+        assert entity._desired_real_mode() == HVACMode.COOL  # arms timer
+        armed_at = entity._pending_flip_since
+
+        # Drift up into the dead-zone (between mid - FLIP_MARGIN and mid):
+        # neither wrong_side nor right_side, so timer state is preserved.
+        advance(60)
+        self._set(entity, mid - FLIP_MARGIN + 0.1)
+        assert entity._desired_real_mode() == HVACMode.COOL
+        assert entity._pending_flip_since == armed_at
+
+        # Drop back past margin and let the original dwell complete.
+        advance(60)
+        self._set(entity, mid - FLIP_MARGIN - 0.1)
+        assert entity._desired_real_mode() == HVACMode.COOL
+        # Total elapsed since arm = 60 + 60 + remaining; advance just enough
+        # to cross the dwell threshold.
+        advance(FLIP_DWELL - 120)
+        assert entity._desired_real_mode() == HVACMode.HEAT
 
 
-class TestDesiredRealModeHysteresis:
-    """Tests for the band-boundary and OFF behaviour in _desired_real_mode."""
+class TestLeavingAutoClearsCommitment:
+    """Switching to a non-AUTO mode discards the AUTO commitment so the
+    next AUTO entry re-picks from current conditions."""
 
-    def _entity(self, inside: float, outside: float | None = None):
-        hass = _make_hass_mock(inside_temp=inside, outside_temp=outside)
-        config = {
-            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
-            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
-        }
-        if outside is not None:
-            config[CONF_OUTSIDE_SENSOR] = OUTSIDE_SENSOR_ID
-        entity = _make_entity(hass, config)
+    def _entity(self):
+        hass = _make_hass_mock()
+        entity = _make_entity(hass)
         entity._hvac_mode = HVACMode.AUTO
         entity._preset_mode = PRESET_HOME
-        entity._current_temperature = inside
-        entity._outside_temperature = outside
+        entity._auto_mode = HVACMode.COOL
+        entity._pending_flip_since = datetime.datetime(
+            2026, 1, 1, tzinfo=datetime.timezone.utc
+        )
+        entity.async_write_ha_state = MagicMock()
         return entity
 
-    def test_in_range_returns_off(self):
-        """When inside is within the comfort band, return OFF."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid)
-        assert entity._desired_real_mode() == HVACMode.OFF
+    @pytest.mark.asyncio
+    async def test_switch_to_off_clears_commitment(self):
+        entity = self._entity()
+        await entity.async_set_hvac_mode(HVACMode.OFF)
+        assert entity._auto_mode is None
+        assert entity._pending_flip_since is None
 
-    def test_below_low_plus_deadband_heats(self):
-        """At low + deadband (HEAT boundary) → HEAT."""
-        entity = self._entity(inside=DEFAULT_HOME_MIN + INSIDE_DEADBAND)
-        assert entity._desired_real_mode() == HVACMode.HEAT
+    @pytest.mark.asyncio
+    async def test_switch_to_heat_clears_commitment(self):
+        entity = self._entity()
+        await entity.async_set_hvac_mode(HVACMode.HEAT)
+        assert entity._auto_mode is None
+        assert entity._pending_flip_since is None
 
-    def test_below_low_heats(self):
-        """Below low setpoint → HEAT."""
-        entity = self._entity(inside=DEFAULT_HOME_MIN - 0.5)
-        assert entity._desired_real_mode() == HVACMode.HEAT
+    @pytest.mark.asyncio
+    async def test_switch_to_cool_clears_commitment(self):
+        entity = self._entity()
+        await entity.async_set_hvac_mode(HVACMode.COOL)
+        assert entity._auto_mode is None
+        assert entity._pending_flip_since is None
 
-    def test_above_high_cools(self):
-        """Above high setpoint → COOL."""
-        entity = self._entity(inside=DEFAULT_HOME_MAX + 0.5)
-        assert entity._desired_real_mode() == HVACMode.COOL
-
-    def test_21_23_band_cools_at_22_5(self):
-        """Issue regression: 21-23 band should switch to COOL at 22.5.
-
-        high - INSIDE_DEADBAND = 23 - 0.5 = 22.5, so at 22.5 the system
-        should engage cooling.
-        """
-        hass = _make_hass_mock(inside_temp=22.5)
-        config = {
-            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
-            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
-        }
-        entity = _make_entity(hass, config)
-        entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_NONE
-        entity._target_temp_low = 21.0
-        entity._target_temp_high = 23.0
-        entity._current_temperature = 22.5
-        assert entity._desired_real_mode() == HVACMode.COOL
-
-    def test_21_23_band_in_band_returns_off(self):
-        """In 21-23 band, temperature within the band → OFF (real device off)."""
-        hass = _make_hass_mock(inside_temp=22.4)
-        config = {
-            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
-            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
-        }
-        entity = _make_entity(hass, config)
-        entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_NONE
-        entity._target_temp_low = 21.0
-        entity._target_temp_high = 23.0
-        entity._current_temperature = 22.4
-        assert entity._desired_real_mode() == HVACMode.OFF
-
-    def test_21_23_band_heats_at_21_5(self):
-        """In 21-23 band, temperature at low + deadband (21.5) → HEAT.
-
-        low + INSIDE_DEADBAND = 21 + 0.5 = 21.5 is the HEAT trigger boundary.
-        The real device is set to 21.5 so its own deadband causes heating to
-        start at approximately 21 °C (the configured low setpoint).
-        """
-        hass = _make_hass_mock(inside_temp=21.5)
-        config = {
-            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
-            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
-        }
-        entity = _make_entity(hass, config)
-        entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_NONE
-        entity._target_temp_low = 21.0
-        entity._target_temp_high = 23.0
-        entity._current_temperature = 21.5
-        assert entity._desired_real_mode() == HVACMode.HEAT
-
-    def test_at_high_minus_deadband_cools(self):
-        """At high - deadband (COOL boundary) → COOL."""
-        entity = self._entity(inside=DEFAULT_HOME_MAX - INSIDE_DEADBAND)
-        assert entity._desired_real_mode() == HVACMode.COOL
+    @pytest.mark.asyncio
+    async def test_switch_to_auto_does_not_clear_existing_commitment(self):
+        """Setting AUTO while already in AUTO must not blow away an
+        in-flight dwell timer."""
+        entity = self._entity()
+        # Already in AUTO with a dwell timer running.
+        await entity.async_set_hvac_mode(HVACMode.AUTO)
+        # _async_sync_real_climate may re-evaluate but the commitment
+        # itself is preserved by async_set_hvac_mode.
+        assert entity._auto_mode == HVACMode.COOL
 
 
 # ---------------------------------------------------------------------------
@@ -638,94 +629,69 @@ class TestStateCallbacks:
 # ---------------------------------------------------------------------------
 
 class TestSyncedSetpoints:
-    """Tests verifying _async_sync_real_climate sends the right setpoint."""
+    """Tests verifying _async_sync_real_climate sends the right setpoint.
 
-    def _entity(self, inside: float = 22.0, outside: float | None = None):
-        hass = _make_hass_mock(inside_temp=inside, outside_temp=outside)
-        config = {
-            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
-            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
-        }
-        if outside is not None:
-            config[CONF_OUTSIDE_SENSOR] = OUTSIDE_SENSOR_ID
-        entity = _make_entity(hass, config)
-        entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_HOME
-        entity._current_temperature = inside
-        entity._outside_temperature = outside
-        return entity
+    In AUTO the real device's setpoint is the comfort-band midpoint (rounded
+    directionally to a whole integer).  HEAT rounds up, COOL rounds down,
+    with a fall-back to the opposite-direction integer bound when the band
+    is too narrow for the directional rounding to land inside it.
+    """
 
     @pytest.mark.asyncio
-    async def test_sync_sends_low_plus_deadband_when_heating(self):
-        """_async_sync_real_climate targets low + INSIDE_DEADBAND when in HEAT.
-
-        The real device's own internal deadband then starts heating at
-        approximately the configured low setpoint.  The value is rounded up
-        to a whole integer because real thermostats only accept integer
-        setpoints and silently round anything else, which otherwise drives a
-        resend-every-sensor-update loop (see test_sync_heat_target_is_integer).
-        """
+    async def test_sync_heat_targets_midpoint_rounded_up(self):
+        """HEAT in AUTO: target = ceil(midpoint), within the band."""
+        low, high = 21.0, 24.0  # midpoint 22.5 → ceil = 23
         hass = _make_hass_mock(
             real_climate_state=HVACMode.HEAT.value,
             real_climate_temp=None,
-            inside_temp=DEFAULT_HOME_MIN - 1,
+            inside_temp=low - 1,
         )
         entity = _make_entity(hass)
         entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_HOME
-        entity._current_temperature = DEFAULT_HOME_MIN - 1
+        entity._preset_mode = PRESET_NONE
+        entity._target_temp_low = low
+        entity._target_temp_high = high
+        entity._current_temperature = low - 1
+        entity._auto_mode = HVACMode.HEAT
         await entity._async_sync_real_climate()
         hass.services.async_call.assert_called_once()
         call_args = hass.services.async_call.call_args
         assert call_args[0][0] == "climate"
         assert call_args[0][1] == "set_temperature"
-        assert call_args[0][2]["temperature"] == math.ceil(
-            DEFAULT_HOME_MIN + INSIDE_DEADBAND
-        )
+        sent = call_args[0][2]["temperature"]
+        assert sent == 23
+        assert sent == int(sent)
+        assert call_args[0][2]["hvac_mode"] == HVACMode.HEAT.value
 
     @pytest.mark.asyncio
-    async def test_sync_heat_target_is_integer(self):
-        """Issue #46 regression: HEAT target must be a whole integer.
-
-        Real thermostats only accept integer setpoints.  Sending a
-        half-degree value like 21.5 is silently rounded to 21 by the device,
-        leaving current_temp != target_temp forever, which fires a fresh
-        set_temperature call on every inside-sensor update and manifests as
-        the setpoint fluttering between 21 and 21.5 in the UI.  We round up
-        for HEAT so the effective engagement point stays at low.
-        """
-        low, high = 21.0, 23.0
+    async def test_sync_cool_targets_midpoint_rounded_down(self):
+        """COOL in AUTO: target = floor(midpoint), within the band."""
+        low, high = 21.0, 24.0  # midpoint 22.5 → floor = 22
         hass = _make_hass_mock(
-            real_climate_state=HVACMode.HEAT.value,
-            real_climate_temp=21,  # device rounded our previous 21.5 to 21
-            inside_temp=low - 1,
+            real_climate_state=HVACMode.COOL.value,
+            real_climate_temp=None,
+            inside_temp=high + 1,
         )
         entity = _make_entity(hass)
         entity._hvac_mode = HVACMode.AUTO
         entity._preset_mode = PRESET_NONE
         entity._target_temp_low = low
         entity._target_temp_high = high
-        entity._current_temperature = low - 1
+        entity._current_temperature = high + 1
+        entity._auto_mode = HVACMode.COOL
         await entity._async_sync_real_climate()
         call_args = hass.services.async_call.call_args
         sent = call_args[0][2]["temperature"]
-        assert sent == int(sent), f"expected integer target, got {sent}"
-        assert sent == 22  # ceil(21 + 0.5)
+        assert sent == 22
+        assert sent == int(sent)
 
     @pytest.mark.asyncio
-    async def test_sync_heat_no_resend_when_device_holds_integer_target(self):
-        """Once the integer target is stored by the device, no resend happens.
-
-        The previous behaviour sent 21.5, the device stored 21 (integer
-        rounding), and the ``temp_changed`` check (`abs(21 - 21.5) > 0.1`)
-        fired on every sensor update.  Rounding to an integer means the
-        device's reported setpoint matches what we sent, so sync returns
-        early and the flutter disappears.
-        """
+    async def test_sync_21_23_band_heat_target_is_22(self):
+        """21-23 band: midpoint is 22 (integer), HEAT and COOL both send 22."""
         low, high = 21.0, 23.0
         hass = _make_hass_mock(
             real_climate_state=HVACMode.HEAT.value,
-            real_climate_temp=22,  # matches what we now send (ceil(21.5))
+            real_climate_temp=None,
             inside_temp=low - 1,
         )
         entity = _make_entity(hass)
@@ -734,12 +700,12 @@ class TestSyncedSetpoints:
         entity._target_temp_low = low
         entity._target_temp_high = high
         entity._current_temperature = low - 1
+        entity._auto_mode = HVACMode.HEAT
         await entity._async_sync_real_climate()
-        hass.services.async_call.assert_not_called()
+        assert hass.services.async_call.call_args[0][2]["temperature"] == 22
 
     @pytest.mark.asyncio
-    async def test_sync_cool_target_is_integer(self):
-        """Mirror of the HEAT test — COOL target must also be a whole integer."""
+    async def test_sync_21_23_band_cool_target_is_22(self):
         low, high = 21.0, 23.0
         hass = _make_hass_mock(
             real_climate_state=HVACMode.COOL.value,
@@ -752,109 +718,132 @@ class TestSyncedSetpoints:
         entity._target_temp_low = low
         entity._target_temp_high = high
         entity._current_temperature = high + 1
+        entity._auto_mode = HVACMode.COOL
         await entity._async_sync_real_climate()
-        call_args = hass.services.async_call.call_args
-        sent = call_args[0][2]["temperature"]
-        assert sent == int(sent), f"expected integer target, got {sent}"
+        assert hass.services.async_call.call_args[0][2]["temperature"] == 22
 
     @pytest.mark.asyncio
-    async def test_sync_sends_off_when_in_band(self):
-        """_async_sync_real_climate turns real device OFF when temp is in the band."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+    async def test_sync_no_resend_when_device_holds_target(self):
+        """When the device's reported setpoint matches what we'd send, no
+        service call fires — guards against a per-sensor-update resend
+        loop (the integer-rounding fix from #46/#47)."""
+        low, high = 21.0, 23.0  # midpoint 22 (integer)
         hass = _make_hass_mock(
             real_climate_state=HVACMode.HEAT.value,
-            real_climate_temp=None,
-            inside_temp=mid,
-        )
-        entity = _make_entity(hass)
-        entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_HOME
-        entity._current_temperature = mid
-        await entity._async_sync_real_climate()
-        hass.services.async_call.assert_called_once()
-        call_args = hass.services.async_call.call_args
-        assert call_args[0][0] == "climate"
-        assert call_args[0][1] == "set_hvac_mode"
-        assert call_args[0][2]["hvac_mode"] == HVACMode.OFF.value
-
-    @pytest.mark.asyncio
-    async def test_sync_no_command_when_already_off_in_band(self):
-        """_async_sync_real_climate skips the service call when device is already OFF."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        hass = _make_hass_mock(
-            real_climate_state=HVACMode.OFF.value,
-            real_climate_temp=None,
-            inside_temp=mid,
-        )
-        entity = _make_entity(hass)
-        entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_HOME
-        entity._current_temperature = mid
-        await entity._async_sync_real_climate()
-        hass.services.async_call.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_sync_sends_high_minus_one_when_cooling(self):
-        """_async_sync_real_climate sends high-1 when in COOL to avoid integer overshoot."""
-        hass = _make_hass_mock(
-            real_climate_state=HVACMode.COOL.value,
-            real_climate_temp=None,
-            inside_temp=DEFAULT_HOME_MAX + 1,
-        )
-        entity = _make_entity(hass)
-        entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_HOME
-        entity._current_temperature = DEFAULT_HOME_MAX + 1
-        await entity._async_sync_real_climate()
-        hass.services.async_call.assert_called_once()
-        call_args = hass.services.async_call.call_args
-        assert call_args[0][0] == "climate"
-        assert call_args[0][1] == "set_temperature"
-        assert call_args[0][2]["temperature"] == DEFAULT_HOME_MAX - 1
-
-    @pytest.mark.asyncio
-    async def test_sync_cool_target_21_23_band(self):
-        """Issue regression: 21-23 band → cooling target must be 22, not 23.
-
-        When the band is 21-23 and the real device only accepts integers, using
-        23 as the cooling target allows the device's own ±0.5 °C hysteresis to
-        reach 23.5, which rounds to 24.  Using 22 (high - 1) keeps the
-        effective upper temperature within the configured band.
-        """
-        low, high = 21.0, 23.0
-        hass = _make_hass_mock(
-            real_climate_state=HVACMode.COOL.value,
-            real_climate_temp=None,
-            inside_temp=high + 0.1,
+            real_climate_temp=22,  # exactly what we'd send
+            inside_temp=low - 1,
         )
         entity = _make_entity(hass)
         entity._hvac_mode = HVACMode.AUTO
         entity._preset_mode = PRESET_NONE
         entity._target_temp_low = low
         entity._target_temp_high = high
-        entity._current_temperature = high + 0.1
+        entity._current_temperature = low - 1
+        entity._auto_mode = HVACMode.HEAT
         await entity._async_sync_real_climate()
-        call_args = hass.services.async_call.call_args
-        assert call_args[0][2]["temperature"] == high - 1  # 22, not 23
+        hass.services.async_call.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_sync_cool_target_capped_at_low_for_narrow_band(self):
-        """Narrow band: cooling target sent to real device must not drop below low."""
+    async def test_sync_in_auto_never_sends_off(self):
+        """In AUTO the real device is never commanded OFF, even when inside
+        is squarely in the comfort band."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         hass = _make_hass_mock(
             real_climate_state=HVACMode.COOL.value,
+            real_climate_temp=22,
+            inside_temp=mid,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = mid
+        # No prior commitment → initial pick will run; never sends OFF.
+        await entity._async_sync_real_climate()
+        for call in hass.services.async_call.call_args_list:
+            args = call[0]
+            if args[1] == "set_hvac_mode":
+                assert args[2]["hvac_mode"] != HVACMode.OFF.value
+            elif args[1] == "set_temperature":
+                assert args[2]["hvac_mode"] != HVACMode.OFF.value
+
+    @pytest.mark.asyncio
+    async def test_sync_off_when_user_commanded_off(self):
+        """When smart climate's own hvac_mode is OFF, the real device is
+        commanded OFF (path covers the race between sensor-callback
+        dispatch and a user-driven mode switch to OFF)."""
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.HEAT.value,
+            real_climate_temp=22,
+            inside_temp=22,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.OFF
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = 22.0
+        await entity._async_sync_real_climate()
+        hass.services.async_call.assert_called_once()
+        call_args = hass.services.async_call.call_args
+        assert call_args[0][1] == "set_hvac_mode"
+        assert call_args[0][2]["hvac_mode"] == HVACMode.OFF.value
+
+    @pytest.mark.asyncio
+    async def test_sync_no_off_command_when_already_off(self):
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.OFF.value,
             real_climate_temp=None,
-            inside_temp=23.0,
+            inside_temp=22.0,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.OFF
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = 22.0
+        await entity._async_sync_real_climate()
+        hass.services.async_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_sync_narrow_band_heat_falls_back_to_floor_high(self):
+        """Band 21-21.5 (midpoint 21.25): HEAT ceil = 22 is above high.
+        Fall back to floor(high) = 21 to keep the target inside the band
+        and an integer."""
+        low, high = 21.0, 21.5
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.HEAT.value,
+            real_climate_temp=None,
+            inside_temp=low - 1,
         )
         entity = _make_entity(hass)
         entity._hvac_mode = HVACMode.AUTO
         entity._preset_mode = PRESET_NONE
-        entity._target_temp_low = 22.0
-        entity._target_temp_high = 22.5  # only 0.5 °C wide
-        entity._current_temperature = 23.0  # above high → COOL
+        entity._target_temp_low = low
+        entity._target_temp_high = high
+        entity._current_temperature = low - 1
+        entity._auto_mode = HVACMode.HEAT
         await entity._async_sync_real_climate()
-        call_args = hass.services.async_call.call_args
-        # high - 1 = 21.5 < low = 22.0, so target must be capped at low
-        assert call_args[0][2]["temperature"] == 22.0
+        sent = hass.services.async_call.call_args[0][2]["temperature"]
+        assert sent == 21
+        assert sent == int(sent)
+
+    @pytest.mark.asyncio
+    async def test_sync_narrow_band_cool_falls_back_to_ceil_low(self):
+        """Band 20.5-21 (midpoint 20.75): COOL floor = 20 is below low.
+        Fall back to ceil(low) = 21."""
+        low, high = 20.5, 21.0
+        hass = _make_hass_mock(
+            real_climate_state=HVACMode.COOL.value,
+            real_climate_temp=None,
+            inside_temp=high + 1,
+        )
+        entity = _make_entity(hass)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_NONE
+        entity._target_temp_low = low
+        entity._target_temp_high = high
+        entity._current_temperature = high + 1
+        entity._auto_mode = HVACMode.COOL
+        await entity._async_sync_real_climate()
+        sent = hass.services.async_call.call_args[0][2]["temperature"]
+        assert sent == 21
+        assert sent == int(sent)
 
 
 # ---------------------------------------------------------------------------

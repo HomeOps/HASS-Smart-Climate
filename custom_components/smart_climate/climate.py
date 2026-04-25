@@ -8,6 +8,7 @@ Wraps a physical climate device and adds:
 """
 from __future__ import annotations
 
+import datetime
 import logging
 import math
 from typing import Any
@@ -49,7 +50,8 @@ from .const import (
     DEFAULT_HOME_MIN,
     DEFAULT_SLEEP_MAX,
     DEFAULT_SLEEP_MIN,
-    INSIDE_DEADBAND,
+    FLIP_DWELL,
+    FLIP_MARGIN,
     MAX_TEMP,
     MIN_TEMP,
     MIN_TEMP_DIFF,
@@ -77,10 +79,14 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
     """EcoBee-like smart thermostat that wraps a real climate entity.
 
     In AUTO mode the entity manages a *temperature range* (low/high setpoints)
-    and automatically switches the underlying climate device between HEAT and
-    COOL as the inside temperature drifts outside the comfort band.  An
-    optional outside temperature sensor further refines the decision when the
-    inside temperature is already within range.
+    and picks HEAT or COOL once, holding that mode while the (modulating)
+    real device settles on the comfort-band midpoint.  HEAT↔COOL flips only
+    after the inside temperature has been continuously past the midpoint by
+    FLIP_MARGIN for FLIP_DWELL seconds — i.e. the room is genuinely asking
+    for the opposite mode, not just jittering across the boundary.  The real
+    device is never commanded OFF in AUTO; on inverter heat pumps a steady
+    setpoint at low modulation costs less than the start-up of an OFF→ON
+    cycle, and short OFF cycles defeat the unit's own steady-state operation.
 
     Four presets are supported:
       - Home  – default daytime comfort range
@@ -147,12 +153,17 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # flight so the two paths do not issue overlapping service calls.
         self._updating_from_control: bool = False
 
-        # Last HEAT/COOL/OFF decision pushed to the real device in AUTO mode.
-        # Used as the "previous state" input for mode hysteresis so that tiny
-        # inside-sensor jitter across the commit edge (high - DEADBAND or
-        # low + DEADBAND) does not flip the real device's mode on every
-        # sensor update.  None means no AUTO decision has been made yet.
-        self._last_real_mode: HVACMode | None = None
+        # Sticky HEAT/COOL choice for AUTO mode.  None means no AUTO decision
+        # has been made yet (initial entry, or after leaving AUTO).  Once
+        # set, _desired_real_mode returns this value until the flip rule
+        # commits the opposite mode.
+        self._auto_mode: HVACMode | None = None
+
+        # Timestamp at which the inside temperature first crossed FLIP_MARGIN
+        # past the midpoint *against* the current _auto_mode.  Cleared when
+        # the temperature returns to the correct half of the band; flips
+        # _auto_mode once it has been set continuously for FLIP_DWELL.
+        self._pending_flip_since: datetime.datetime | None = None
 
     # ------------------------------------------------------------------
     # ClimateEntity properties
@@ -449,71 +460,78 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # PRESET_NONE / manual – use whatever was last set
         return (self._target_temp_low, self._target_temp_high)
 
+    def _now(self) -> datetime.datetime:
+        """Return the current UTC time.  Indirection point for tests."""
+        return datetime.datetime.now(datetime.timezone.utc)
+
     def _desired_real_mode(self) -> HVACMode:
         """Determine which mode (HEAT/COOL/OFF) the real device should be in.
 
-        Decision logic:
-        1. If inside temp is at or above high - INSIDE_DEADBAND → COOL.
-           This engages cooling before the temperature exits the comfort band,
-           giving the system time to react and preventing overshoot.
-        2. If inside temp is at or below low + INSIDE_DEADBAND → HEAT.
-           The target sent to the real device is low + INSIDE_DEADBAND so that
-           the device's own internal deadband causes it to start heating at
-           approximately the configured low setpoint.
-        3. If inside temp is within the comfort band → OFF.
-           The real device is turned off when the temperature is comfortable,
-           saving energy and avoiding unnecessary wear.
+        For non-AUTO modes the user's choice is passed through.
+
+        In AUTO mode:
+        1. If no mode has been chosen yet, pick HEAT or COOL once based on
+           the outside sensor (or inside-vs-midpoint when no outside sensor
+           is configured).  Tie-break to COOL.
+        2. Otherwise stick with the previously-committed mode regardless of
+           where the inside temperature sits — the (modulating) real device
+           is expected to settle on the band midpoint.
+        3. Flip to the opposite mode only when the inside temperature has
+           been continuously past the midpoint by FLIP_MARGIN against the
+           committed mode for FLIP_DWELL seconds.  The dwell timer is reset
+           only when the temperature crosses fully back to the correct side
+           of the midpoint, so jitter near the FLIP_MARGIN threshold doesn't
+           keep stalling the flip.
+
+        AUTO never returns OFF — the real device is left running at low
+        modulation rather than being repeatedly start/stop cycled.
         """
         if self._hvac_mode == HVACMode.OFF:
             return HVACMode.OFF
         if self._hvac_mode in (HVACMode.HEAT, HVACMode.COOL):
             return self._hvac_mode
 
-        # AUTO mode
+        # AUTO mode – need an inside reading to make any decision.
         if self._current_temperature is None or math.isnan(self._current_temperature):
-            # No sensor reading – keep real device unchanged
-            return HVACMode.AUTO
+            return self._auto_mode or HVACMode.AUTO
 
         inside = self._current_temperature
         low, high = self._active_range()
-
-        # Check COOL first so it takes priority for very narrow bands where
-        # the two deadband zones could overlap (band width < 2 * INSIDE_DEADBAND).
-        # MIN_TEMP_DIFF = 0.5 allows bands as narrow as 0.5 °C, while a full
-        # non-overlapping OFF zone requires at least 2 * INSIDE_DEADBAND = 1 °C.
-        # For sub-1 °C bands the device will be either HEAT or COOL (never OFF);
-        # COOL is checked first to avoid over-heating a near-target room.
-        if inside >= high - INSIDE_DEADBAND:
-            self._last_real_mode = HVACMode.COOL
-            return HVACMode.COOL
-        if inside <= low + INSIDE_DEADBAND:
-            self._last_real_mode = HVACMode.HEAT
-            return HVACMode.HEAT
-
-        # In-band mode hysteresis.  The commit edges (high - DEADBAND and
-        # low + DEADBAND) have no hysteresis on their own: a sensor tick of
-        # ±0.01 °C across one of them would bounce the decision between the
-        # committed mode and the in-band OFF below.  Stick with the
-        # previously-chosen HEAT or COOL commitment until the inside
-        # temperature has travelled to the comfort-band midpoint, i.e. only
-        # release the commit once the room has genuinely moved towards the
-        # other edge.  Mode-axis analogue of the setpoint resend loop that
-        # #46 / #47 fixed.
         mid = (low + high) / 2.0
-        if self._last_real_mode == HVACMode.COOL and inside > mid:
-            return HVACMode.COOL
-        if self._last_real_mode == HVACMode.HEAT and inside < mid:
-            return HVACMode.HEAT
 
-        # Temperature is comfortably within the band → turn the real device
-        # off.  The previous outside-sensor in-band bias (PR #35) was
-        # removed in PR #52: combined with the hysteresis above it produced
-        # large active HEAT↔COOL swings across the whole band (#52), which
-        # is worse than the rapid off/heat/off flutter that #35 was trying
-        # to suppress.  With the commit hysteresis in place, OFF in-band is
-        # both simpler and kinder to the HVAC.
-        self._last_real_mode = HVACMode.OFF
-        return HVACMode.OFF
+        # Initial mode pick.
+        if self._auto_mode is None:
+            ref: float | None = self._outside_temperature
+            if ref is None or math.isnan(ref):
+                ref = inside
+            self._auto_mode = HVACMode.HEAT if ref < mid else HVACMode.COOL
+            self._pending_flip_since = None
+            return self._auto_mode
+
+        # Flip evaluation.  Wrong-side / right-side bands have a deadzone
+        # in between (mid ± FLIP_MARGIN) where the timer keeps running but
+        # is not reset, so sensor jitter near the margin doesn't repeatedly
+        # cancel an in-progress flip.
+        if self._auto_mode == HVACMode.COOL:
+            wrong_side = inside <= mid - FLIP_MARGIN
+            right_side = inside >= mid
+        else:  # HEAT
+            wrong_side = inside >= mid + FLIP_MARGIN
+            right_side = inside <= mid
+
+        now = self._now()
+        if wrong_side:
+            if self._pending_flip_since is None:
+                self._pending_flip_since = now
+            elif (now - self._pending_flip_since).total_seconds() >= FLIP_DWELL:
+                self._auto_mode = (
+                    HVACMode.HEAT if self._auto_mode == HVACMode.COOL else HVACMode.COOL
+                )
+                self._pending_flip_since = None
+        elif right_side:
+            self._pending_flip_since = None
+
+        return self._auto_mode
 
     # ------------------------------------------------------------------
     # Real-climate synchronisation
@@ -532,8 +550,10 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
         current_mode = real_state.state
 
-        # When the temperature is comfortably within the band, turn the real
-        # device off.  Only send the command if it isn't already off.
+        # OFF is only reachable here when the user commanded smart climate
+        # OFF after a sensor callback was already queued — AUTO never
+        # returns OFF.  Forward the OFF; only send the command if the real
+        # device isn't already off.
         if real_mode == HVACMode.OFF:
             if current_mode != HVACMode.OFF.value:
                 await self.hass.services.async_call(
@@ -544,35 +564,36 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
                 )
             return
 
-        # In AUTO mode, target low + INSIDE_DEADBAND when heating so the real
-        # device's own internal deadband starts heating at approximately the
-        # configured low setpoint.  Target high - 1 when cooling to prevent
-        # overshooting the band.
+        # In AUTO mode, the modulating real device is asked to settle on the
+        # comfort-band midpoint; mode selection (HEAT vs COOL) is what
+        # determines whether the room is being warmed or cooled towards it.
         low: float | None = None
+        high: float | None = None
         if self._hvac_mode == HVACMode.AUTO:
             low, high = self._active_range()
-            if real_mode == HVACMode.HEAT:
-                target_temp = low + INSIDE_DEADBAND
-            else:  # COOL
-                target_temp = max(low, high - 1)
+            target_temp = (low + high) / 2.0
         else:
             target_temp = self._target_temperature
 
         # Real thermostats only accept whole-integer setpoints, and their
         # advertised ``target_temp_step`` cannot be trusted to reflect that.
         # Always round to an integer so the device stores exactly what we
-        # send — otherwise it silently rounds (e.g. 21.5 → 21) and every
+        # send — otherwise it silently rounds (e.g. 22.5 → 22) and every
         # inside-sensor update drives another set_temperature call trying to
-        # "correct" the mismatch, producing the 21 ↔ 21.5 target flutter.
-        # Round directionally so engagement semantics survive: up for HEAT
-        # (keep heating at the low setpoint), down for COOL (keep cooling at
-        # the high setpoint).
+        # "correct" the mismatch, producing target flutter.
+        # Round directionally (up for HEAT, down for COOL) and stay inside
+        # the comfort band, falling back to the opposite-direction integer
+        # bound when the band is too narrow for the directional rounding to
+        # land inside it (e.g. mid 21.25 in a 21–21.5 band: ceil=22 is
+        # above high → use floor(high)=21 instead).
         if real_mode == HVACMode.HEAT:
             target_temp = float(math.ceil(target_temp))
+            if high is not None and target_temp > high:
+                target_temp = float(math.floor(high))
         else:  # COOL
             target_temp = float(math.floor(target_temp))
-            if low is not None:
-                target_temp = max(low, target_temp)
+            if low is not None and target_temp < low:
+                target_temp = float(math.ceil(low))
 
         current_temp = real_state.attributes.get("temperature")
 
@@ -606,6 +627,13 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         self._updating_from_control = True
         old_mode = self._hvac_mode
         self._hvac_mode = hvac_mode
+
+        # Leaving AUTO clears the sticky AUTO state so the next AUTO entry
+        # picks a fresh mode from current temperatures rather than reusing
+        # a stale commitment.
+        if hvac_mode != HVACMode.AUTO:
+            self._auto_mode = None
+            self._pending_flip_since = None
 
         if hvac_mode == HVACMode.OFF:
             await self.hass.services.async_call(
