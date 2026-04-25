@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v1.0.3...v2.0.0) (2026-04-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* AUTO no longer turns the real device OFF when inside is within the comfort band.  Users who relied on the wrapper to OFF their real device must switch smart_climate to OFF mode explicitly. INSIDE_DEADBAND constant removed; FLIP_MARGIN and FLIP_DWELL added.
+
+### Features
+
+* sticky AUTO mode for inverter heat pumps; never command OFF ([#54](https://github.com/HomeOps/HASS-Smart-Climate/issues/54)) ([d9a7f25](https://github.com/HomeOps/HASS-Smart-Climate/commit/d9a7f25b0a98a6e795fddc654407f3bd011319a2))
+
 ## [1.0.3](https://github.com/HomeOps/HASS-Smart-Climate/compare/v1.0.2...v1.0.3) (2026-04-20)
 
 
