@@ -219,6 +219,89 @@ rm -rf .pytest_cache __pycache__ .coverage
   `hvac_action` for UI and never feed back into preset/setpoint state
 - All preset temperature ranges must respect MIN_TEMP_DIFF constraint
 
+## Future Work — Per-preset inside sensor
+
+> **Status:** design idea, not implemented. Captured here so a future
+> session has the constraints in front of it before starting.
+
+### Concept
+
+Today the integration has one indoor sensor (`CONF_INSIDE_SENSOR`)
+used for *every* preset. Real homes don't behave that way:
+
+- At **Sleep**, only the bedrooms matter — the unoccupied living room
+  drifting an extra degree shouldn't trigger a mode flip.
+- At **Home (day)**, common areas are what we want to keep comfortable;
+  bedrooms can swing.
+- At **Away**, a coarse whole-home average is fine.
+
+The fix: **each preset gets its own indoor sensor** that the user
+points at.
+
+### Proposed mechanism (deliberately minimal)
+
+The integration **does not** compute, expose, or aggregate temperatures
+itself. Building per-zone aggregates is the user's job using built-in
+**HA helpers** — Min/Max/Mean helper, Group helper, Template sensor —
+configured in the HA UI:
+
+```
+sensor.upstairs_avg_temp   = mean(bedroom1, bedroom2, bedroom3)
+sensor.downstairs_avg_temp = mean(living, dining, kitchen, den)
+sensor.whole_home_temperature = (existing) — fallback
+```
+
+The integration's only addition is config:
+
+| Preset | Sensor field |
+|--------|--------------|
+| Home   | `CONF_INSIDE_SENSOR_HOME`  → `sensor.downstairs_avg_temp` |
+| Sleep  | `CONF_INSIDE_SENSOR_SLEEP` → `sensor.upstairs_avg_temp` |
+| Away   | `CONF_INSIDE_SENSOR_AWAY`  → `sensor.whole_home_temperature` |
+
+When the preset changes, smart_climate switches which sensor it reads
+for `current_temperature` and re-subscribes its
+`async_track_state_change_event` to the new entity.
+
+### Implications for downstream (Midea Follow Me)
+
+`ESPHome-Midea-XYE` currently pushes a fixed sensor
+(`sensor.whole_home_temperature`) into the unit via Follow Me. After
+this feature lands, the right thing for it to push is whatever
+`climate.smart_climate.current_temperature` resolves to — i.e. it
+should follow the smart-climate output rather than a static sensor.
+Either:
+
+- **(simpler)** Re-point the ESPHome `homeassistant.sensor` reference
+  at `climate.smart_climate` `current_temperature` attribute. Single
+  source of truth, no preset awareness on the ESPHome side.
+- **(alternative)** Have smart_climate fire a service call /
+  notification when the active sensor changes, and ESPHome re-binds.
+  More code, no real benefit if option 1 works.
+
+Option 1 is the contract: **smart_climate's `current_temperature` is
+the canonical "what the system should track right now"**. Everyone
+downstream reads it.
+
+### Notes & constraints
+
+- **No new platform code.** Keep the integration to `climate.py`. No
+  derived `sensor.py`, no template-engine work. The user owns the
+  helpers.
+- **Backwards compat.** Keep `CONF_INSIDE_SENSOR` as the default for
+  any preset whose per-preset sensor is unset; existing installs keep
+  working with no migration.
+- **Sensor unavailability.** When the active preset's sensor returns
+  `unavailable` / `unknown`, fall back to `CONF_INSIDE_SENSOR`. AUTO
+  must never stall on a missing sensor.
+- **No circular dependency.** Because the integration neither
+  publishes nor aggregates a sensor, the loop that worried me in the
+  earlier draft of this note disappears: data flows preset → sensor
+  selection → climate → setpoint → real device, period.
+- **Preset switch transient.** Re-subscription is synchronous; the new
+  sensor's `last_state` is read immediately so the AUTO algorithm
+  doesn't run on a stale value during the swap.
+
 ## References
 
 - [Home Assistant Climate API](https://developers.home-assistant.io/docs/core/entity/climate/)
