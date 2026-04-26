@@ -162,64 +162,263 @@ class TestDesiredRealMode:
         assert entity._desired_real_mode() == HVACMode.COOL
 
     def test_initial_pick_uses_outside_when_cold(self):
-        """Outside sensor decides the first commitment: cold → HEAT."""
+        """Outside sensor decides the first commitment: cold → HEAT.
+
+        v3: in-band current returns OFF as the unit command, but the
+        commitment side-effect on _auto_mode still fires.
+        """
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         entity = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
-        assert entity._desired_real_mode() == HVACMode.HEAT
+        entity._desired_real_mode()
         assert entity._auto_mode == HVACMode.HEAT
 
     def test_initial_pick_uses_outside_when_warm(self):
         """Outside sensor decides the first commitment: warm → COOL."""
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         entity = self._entity(inside=mid, outside=DEFAULT_HOME_MAX + 5)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
         assert entity._auto_mode == HVACMode.COOL
 
     def test_initial_pick_falls_back_to_inside_when_no_outside(self):
         """No outside sensor: inside-vs-midpoint chooses initial mode."""
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         cold = self._entity(inside=mid - 1.0)
-        assert cold._desired_real_mode() == HVACMode.HEAT
+        cold._desired_real_mode()
+        assert cold._auto_mode == HVACMode.HEAT
         warm = self._entity(inside=mid + 1.0)
-        assert warm._desired_real_mode() == HVACMode.COOL
+        warm._desired_real_mode()
+        assert warm._auto_mode == HVACMode.COOL
 
     def test_initial_pick_at_midpoint_breaks_to_cool(self):
         """Tie at exactly the midpoint with no outside sensor → COOL."""
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         entity = self._entity(inside=mid)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
 
     def test_auto_below_low_picks_heat(self):
-        """Way below the band — initial pick is HEAT (inside fallback)."""
+        """Way below the band — initial pick is HEAT and unit runs HEAT."""
         entity = self._entity(inside=DEFAULT_HOME_MIN - 1)
         assert entity._desired_real_mode() == HVACMode.HEAT
+        assert entity._auto_mode == HVACMode.HEAT
 
     def test_auto_above_high_picks_cool(self):
-        """Way above the band — initial pick is COOL."""
+        """Way above the band — initial pick is COOL and unit runs COOL."""
         entity = self._entity(inside=DEFAULT_HOME_MAX + 1)
         assert entity._desired_real_mode() == HVACMode.COOL
+        assert entity._auto_mode == HVACMode.COOL
 
-    def test_auto_never_returns_off(self):
-        """Smoke test: across a sweep of inside temps in AUTO, OFF is never
-        returned regardless of starting commitment."""
-        for inside in [
-            DEFAULT_HOME_MIN - 5,
-            DEFAULT_HOME_MIN,
-            (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2,
-            DEFAULT_HOME_MAX,
-            DEFAULT_HOME_MAX + 5,
-        ]:
-            for prior in (None, HVACMode.HEAT, HVACMode.COOL):
+    def test_auto_returns_off_when_inside_band(self):
+        """v3 contract — supersedes v2.0.0's "never returns OFF" rule.
+
+        Inside the comfort band (current ∈ [low, high]), AUTO returns OFF
+        regardless of committed direction. The Midea inverter cannot truly
+        idle inside an active mode; commanding OFF is the only way to stop
+        the compressor when no work is needed.
+
+        Outside the band, the committed direction is honoured: above high
+        with COOL committed → COOL; below low with HEAT committed → HEAT.
+        Wrong-side excursions (committed mode opposite to the demand)
+        return OFF until the FLIP_DWELL/FLIP_MARGIN logic flips the
+        committed direction.
+        """
+        low, high = DEFAULT_HOME_MIN, DEFAULT_HOME_MAX
+        # Inside the band: always OFF, regardless of committed direction
+        for inside in [low, low + 0.5, (low + high) / 2, high - 0.5, high]:
+            for prior in (HVACMode.HEAT, HVACMode.COOL):
                 entity = self._entity(inside=inside)
                 entity._auto_mode = prior
-                assert entity._desired_real_mode() != HVACMode.OFF
+                assert entity._desired_real_mode() == HVACMode.OFF, (
+                    f"current={inside} in [{low},{high}], committed={prior}: "
+                    f"expected OFF, got {entity._desired_real_mode()}"
+                )
+
+        # Outside the band, the committed direction matters
+        cool_committed_above = self._entity(inside=high + 1)
+        cool_committed_above._auto_mode = HVACMode.COOL
+        assert cool_committed_above._desired_real_mode() == HVACMode.COOL
+
+        heat_committed_below = self._entity(inside=low - 1)
+        heat_committed_below._auto_mode = HVACMode.HEAT
+        assert heat_committed_below._desired_real_mode() == HVACMode.HEAT
+
+        # Wrong-side excursions: OFF (don't fight; flip dwell ticks)
+        cool_committed_below = self._entity(inside=low - 1)
+        cool_committed_below._auto_mode = HVACMode.COOL
+        assert cool_committed_below._desired_real_mode() == HVACMode.OFF
+
+        heat_committed_above = self._entity(inside=high + 1)
+        heat_committed_above._auto_mode = HVACMode.HEAT
+        assert heat_committed_above._desired_real_mode() == HVACMode.OFF
+
+
+class TestAutoOffInBand:
+    """OFF as a peer state with HEAT/COOL in AUTO mode.
+
+    Replaces the v2.0.0 "never command OFF in AUTO" contract. On Midea
+    inverter heat pumps the wrapper has to provide the idle state itself,
+    because the unit's COOL/HEAT modes don't truly idle the compressor —
+    they hold at a minimum-frequency floor. Diagnosed empirically on
+    2026-04-26 by reproducing the same over-cooling under both XYE and
+    the factory wired thermostat.
+    """
+
+    def _entity(self, inside, low=21.0, high=23.0, committed=HVACMode.COOL):
+        """Build a SmartClimateEntity in AUTO mode with custom band."""
+        hass = _make_hass_mock(inside_temp=inside)
+        config = {
+            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
+            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
+        }
+        entity = _make_entity(hass, config)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = inside
+        # Override Home preset's range for this test
+        entity._preset_ranges[PRESET_HOME] = (low, high)
+        entity._auto_mode = committed
+        return entity
+
+    def test_overnight_in_band_traversal_stays_off(self):
+        """Reproduces the 2026-04-25 overnight observation.
+
+        The room stayed in [21, 23] for the entire night (10 h, 1812
+        whole_home_temperature samples, every value 21.2 ≤ t ≤ 22.8).
+        v2.0.0 ran heat→cool→heat→cool cycles all night anyway because
+        of the 'never OFF' rule and the inverter min-frequency floor.
+
+        New behaviour: OFF the entire time, regardless of which direction
+        AUTO has committed to. Compressor stops, room drifts naturally
+        within the band, no useless cooling-then-heating cycles.
+        """
+        # Sample of actual overnight currents from the diagnostic session
+        overnight_currents = [
+            21.5, 21.7, 22.0, 22.6, 22.7, 22.5,
+            21.4, 21.5, 21.3, 22.6, 22.5, 21.4, 21.3,
+            22.6, 22.5, 21.4, 22.5, 21.5, 21.7,
+        ]
+        for committed in (HVACMode.HEAT, HVACMode.COOL):
+            for current in overnight_currents:
+                entity = self._entity(
+                    inside=current, low=21.0, high=23.0, committed=committed,
+                )
+                assert entity._desired_real_mode() == HVACMode.OFF, (
+                    f"OVERNIGHT-BUG REGRESSION: current={current} "
+                    f"(in [21, 23]), committed={committed} should be OFF "
+                    f"but got {entity._desired_real_mode()}. The Midea "
+                    f"inverter min-frequency floor wastes energy if AUTO "
+                    f"doesn't OFF in-band."
+                )
+
+    def test_in_band_yields_off_for_both_committed_directions(self):
+        """Tighter point-tests covering the band edges and midpoint."""
+        for inside in (21.0, 21.5, 22.0, 22.5, 23.0):
+            for committed in (HVACMode.HEAT, HVACMode.COOL):
+                entity = self._entity(inside=inside, committed=committed)
+                assert entity._desired_real_mode() == HVACMode.OFF
+
+    def test_above_high_with_cool_committed_runs_cool(self):
+        """Outside band on the right side: do work."""
+        entity = self._entity(inside=23.5, committed=HVACMode.COOL)
+        assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_below_low_with_heat_committed_runs_heat(self):
+        entity = self._entity(inside=20.5, committed=HVACMode.HEAT)
+        assert entity._desired_real_mode() == HVACMode.HEAT
+
+    def test_above_high_with_heat_committed_returns_off(self):
+        """Wrong-side excursion: OFF until FLIP_DWELL elapses."""
+        entity = self._entity(inside=23.5, committed=HVACMode.HEAT)
+        assert entity._desired_real_mode() == HVACMode.OFF
+
+    def test_below_low_with_cool_committed_returns_off(self):
+        entity = self._entity(inside=20.5, committed=HVACMode.COOL)
+        assert entity._desired_real_mode() == HVACMode.OFF
+
+
+class TestHvacActionInAutoOff:
+    """hvac_action exposes IDLE in deliberate-OFF (AUTO + in-band).
+
+    The real Midea unit, when commanded OFF, reports hvac_action='off'.
+    The wrapper hides that and surfaces IDLE instead so the user sees
+    "AUTO is resting between calls for work" rather than the alarming
+    "thermostat is OFF" — which usually signals a manual user override.
+    Outside the deliberate-OFF state, hvac_action mirrors the real
+    device's reported action verbatim.
+    """
+
+    def _entity(self, inside, low=21.0, high=23.0, committed=HVACMode.COOL):
+        hass = _make_hass_mock(inside_temp=inside)
+        config = {
+            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
+            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
+        }
+        entity = _make_entity(hass, config)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = inside
+        entity._preset_ranges[PRESET_HOME] = (low, high)
+        entity._auto_mode = committed
+        return entity
+
+    @pytest.mark.asyncio
+    async def test_idle_when_auto_in_band(self):
+        """AUTO + in-band → wrapper sends OFF → hvac_action == IDLE."""
+        entity = self._entity(inside=22.0)  # mid of [21, 23]
+        # Real device will be commanded OFF and report 'off' back to us.
+        entity._hvac_action = HVACAction.OFF
+        await entity._async_sync_real_climate()
+        assert entity._unit_command == HVACMode.OFF
+        assert entity.hvac_action == HVACAction.IDLE
+
+    @pytest.mark.asyncio
+    async def test_mirrors_cooling_when_above_high(self):
+        """AUTO + above-high + COOL committed → unit runs COOL → mirror."""
+        entity = self._entity(inside=23.5, committed=HVACMode.COOL)
+        entity._hvac_action = HVACAction.COOLING  # mirrored from real
+        await entity._async_sync_real_climate()
+        assert entity._unit_command == HVACMode.COOL
+        assert entity.hvac_action == HVACAction.COOLING
+
+    @pytest.mark.asyncio
+    async def test_mirrors_heating_when_below_low(self):
+        """AUTO + below-low + HEAT committed → unit runs HEAT → mirror."""
+        entity = self._entity(inside=20.5, committed=HVACMode.HEAT)
+        entity._hvac_action = HVACAction.HEATING
+        await entity._async_sync_real_climate()
+        assert entity._unit_command == HVACMode.HEAT
+        assert entity.hvac_action == HVACAction.HEATING
+
+    def test_user_off_mode_shows_off_not_idle(self):
+        """User-commanded OFF must read OFF, not IDLE — IDLE is reserved
+        for AUTO's deliberate in-band rest."""
+        entity = self._entity(inside=22.0)
+        entity._hvac_mode = HVACMode.OFF  # user turned it off
+        entity._unit_command = HVACMode.OFF
+        entity._hvac_action = HVACAction.OFF
+        assert entity.hvac_action == HVACAction.OFF
+
+    def test_initial_state_no_unit_command_passes_through(self):
+        """Before the first sync runs, _unit_command is None — fall
+        through to whatever the real device last reported."""
+        entity = self._entity(inside=22.0)
+        entity._unit_command = None
+        entity._hvac_action = HVACAction.COOLING
+        assert entity.hvac_action == HVACAction.COOLING
 
 
 class TestStickyAutoMode:
-    """Sticky-mode behaviour: a committed HEAT/COOL choice survives jitter
-    and only flips after FLIP_DWELL seconds continuously past the midpoint
-    by FLIP_MARGIN against the committed mode (the room is asking for the
-    opposite mode, not just sitting near the boundary).
+    """Sticky **committed direction** behaviour: a committed HEAT/COOL
+    choice survives jitter and only flips after FLIP_DWELL seconds
+    continuously past the midpoint by FLIP_MARGIN against the committed
+    mode (the room is asking for the opposite mode, not just sitting near
+    the boundary).
+
+    These tests assert ``_auto_mode`` (the committed direction) — not
+    ``_desired_real_mode()``, which under v3 returns OFF anywhere inside
+    the comfort band regardless of what direction is committed.  The
+    sticky-direction logic and the unit-command logic are independent
+    layers; this class covers the former.
     """
 
     def _entity(self, inside: float, committed: HVACMode):
@@ -244,12 +443,14 @@ class TestStickyAutoMode:
     def test_cool_stays_cool_above_midpoint(self):
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         entity = self._entity(inside=mid + 0.5, committed=HVACMode.COOL)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
 
     def test_heat_stays_heat_below_midpoint(self):
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         entity = self._entity(inside=mid - 0.5, committed=HVACMode.HEAT)
-        assert entity._desired_real_mode() == HVACMode.HEAT
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.HEAT
 
     def test_cool_survives_jitter_above_low_edge(self):
         """COOL committed; inside jittering at the low band edge does not
@@ -260,7 +461,8 @@ class TestStickyAutoMode:
         # it — i.e. still on the right side / dead-zone boundary.
         entity = self._entity(inside=mid - FLIP_MARGIN + 0.01, committed=HVACMode.COOL)
         for _ in range(5):
-            assert entity._desired_real_mode() == HVACMode.COOL
+            entity._desired_real_mode()
+            assert entity._auto_mode == HVACMode.COOL
 
     def test_cool_does_not_flip_briefly_past_margin(self):
         """COOL committed; a few sensor ticks past the wrong-side margin
@@ -270,20 +472,23 @@ class TestStickyAutoMode:
         now, advance = _fake_clock()
         entity._now = now
         # First tick: starts the dwell timer.
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
         assert entity._pending_flip_since is not None
         # Just under the dwell threshold: still COOL.
         advance(FLIP_DWELL - 1)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
 
     def test_cool_flips_to_heat_after_dwell(self):
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         entity = self._entity(inside=mid - FLIP_MARGIN - 0.1, committed=HVACMode.COOL)
         now, advance = _fake_clock()
         entity._now = now
-        assert entity._desired_real_mode() == HVACMode.COOL  # arms timer
+        entity._desired_real_mode()  # arms timer
+        assert entity._auto_mode == HVACMode.COOL
         advance(FLIP_DWELL)
-        assert entity._desired_real_mode() == HVACMode.HEAT
+        entity._desired_real_mode()
         assert entity._auto_mode == HVACMode.HEAT
         assert entity._pending_flip_since is None
 
@@ -292,9 +497,11 @@ class TestStickyAutoMode:
         entity = self._entity(inside=mid + FLIP_MARGIN + 0.1, committed=HVACMode.HEAT)
         now, advance = _fake_clock()
         entity._now = now
-        assert entity._desired_real_mode() == HVACMode.HEAT
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.HEAT
         advance(FLIP_DWELL)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
 
     def test_dwell_resets_on_full_crossback_to_correct_side(self):
         """COOL committed, inside drops below the wrong-side margin then
@@ -304,22 +511,26 @@ class TestStickyAutoMode:
         entity = self._entity(inside=mid - FLIP_MARGIN - 0.1, committed=HVACMode.COOL)
         now, advance = _fake_clock()
         entity._now = now
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
         assert entity._pending_flip_since is not None
 
         # Cross back fully to the correct (above-midpoint) side.
         advance(60)
         self._set(entity, mid + 0.5)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
         assert entity._pending_flip_since is None
 
         # Now drop below margin again — timer must restart from now,
         # a near-full-dwell wait must NOT flip.
         advance(60)
         self._set(entity, mid - FLIP_MARGIN - 0.1)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
         advance(FLIP_DWELL - 1)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
 
     def test_dwell_keeps_running_in_deadzone(self):
         """If inside drops past margin (arms timer) then drifts up into the
@@ -329,24 +540,28 @@ class TestStickyAutoMode:
         entity = self._entity(inside=mid - FLIP_MARGIN - 0.1, committed=HVACMode.COOL)
         now, advance = _fake_clock()
         entity._now = now
-        assert entity._desired_real_mode() == HVACMode.COOL  # arms timer
+        entity._desired_real_mode()  # arms timer
+        assert entity._auto_mode == HVACMode.COOL
         armed_at = entity._pending_flip_since
 
         # Drift up into the dead-zone (between mid - FLIP_MARGIN and mid):
         # neither wrong_side nor right_side, so timer state is preserved.
         advance(60)
         self._set(entity, mid - FLIP_MARGIN + 0.1)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
         assert entity._pending_flip_since == armed_at
 
         # Drop back past margin and let the original dwell complete.
         advance(60)
         self._set(entity, mid - FLIP_MARGIN - 0.1)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
         # Total elapsed since arm = 60 + 60 + remaining; advance just enough
         # to cross the dwell threshold.
         advance(FLIP_DWELL - 120)
-        assert entity._desired_real_mode() == HVACMode.HEAT
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.HEAT
 
 
 class TestLeavingAutoClearsCommitment:
@@ -744,12 +959,17 @@ class TestSyncedSetpoints:
         hass.services.async_call.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_sync_in_auto_never_sends_off(self):
-        """In AUTO the real device is never commanded OFF, even when inside
-        is squarely in the comfort band."""
+    async def test_sync_in_auto_sends_off_when_in_band(self):
+        """v3 contract — supersedes v2.0.0's "never OFF in AUTO" rule.
+
+        Inside the comfort band the wrapper commands the real device OFF
+        so the Midea inverter actually idles instead of holding its
+        minimum-frequency floor and pumping conditioned air the room
+        doesn't need.
+        """
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         hass = _make_hass_mock(
-            real_climate_state=HVACMode.COOL.value,
+            real_climate_state=HVACMode.COOL.value,  # currently cooling
             real_climate_temp=22,
             inside_temp=mid,
         )
@@ -757,14 +977,12 @@ class TestSyncedSetpoints:
         entity._hvac_mode = HVACMode.AUTO
         entity._preset_mode = PRESET_HOME
         entity._current_temperature = mid
-        # No prior commitment → initial pick will run; never sends OFF.
+        entity._auto_mode = HVACMode.COOL  # already committed to COOL
         await entity._async_sync_real_climate()
-        for call in hass.services.async_call.call_args_list:
-            args = call[0]
-            if args[1] == "set_hvac_mode":
-                assert args[2]["hvac_mode"] != HVACMode.OFF.value
-            elif args[1] == "set_temperature":
-                assert args[2]["hvac_mode"] != HVACMode.OFF.value
+        hass.services.async_call.assert_called_once()
+        call_args = hass.services.async_call.call_args
+        assert call_args[0][1] == "set_hvac_mode"
+        assert call_args[0][2]["hvac_mode"] == HVACMode.OFF.value
 
     @pytest.mark.asyncio
     async def test_sync_off_when_user_commanded_off(self):
