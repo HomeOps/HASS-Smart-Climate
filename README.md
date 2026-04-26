@@ -5,8 +5,9 @@ A HACS-compatible custom component for Home Assistant that turns any climate dev
 ## Features
 
 - **Comfort Presets** – Home, Sleep, Away, and Manual modes with independently configurable temperature ranges (low/high setpoints).
-- **Auto Heat/Cool Switching** – In AUTO mode the thermostat automatically switches the real device between heating and cooling as the inside temperature drifts outside the comfort band.
-- **Outside Temperature Awareness** – When an optional outdoor sensor is configured, it is used as an additional signal for smarter mode decisions when the inside temperature is already within range.
+- **Auto Heat/Cool Switching** – Sticky direction commitment with two-tier flip logic (immediate fast-flip on band-edge violations + 30-min dwell-flip for sustained excursions).
+- **In-band COOL hysteresis with deliberate-OFF** – Stops the inverter min-frequency floor from pumping unwanted cold air; COOL pulses run from `mid + 0.75 °C` down to `mid`, OFF in between.  See [`docs/state-machine.md`](docs/state-machine.md).
+- **Problem detection** – `problems` attribute lists detected issues (sensor unavailable / stale, sustained out-of-band, short-cycling) for dashboards and notifications.
 - **State Restoration** – Thermostat state (mode, preset, setpoints) survives Home Assistant restarts.
 - **HACS Compatible** – Install and update via the Home Assistant Community Store.
 - **UI Configuration** – Set up via the Home Assistant Integrations UI; adjust preset temperatures via the Options flow.
@@ -38,7 +39,7 @@ A HACS-compatible custom component for Home Assistant that turns any climate dev
    | **Thermostat Name** | ✅ | Friendly name for the new thermostat entity |
    | **Climate Device** | ✅ | The real/dumb climate entity to control (e.g. `climate.heatpump`) |
    | **Inside Temperature Sensor** | ✅ | Sensor entity for the indoor temperature |
-   | **Outside Temperature Sensor** | ❌ | Optional sensor for smarter auto mode decisions |
+   | **Outside Temperature Sensor** | ❌ | Optional sensor — tracked for display and future use (free-cooling detection, forecast preconditioning).  No longer consulted for the AUTO direction pick (see [v3.0.2 changelog](CHANGELOG.md)). |
 
 ### Configure preset temperatures
 
@@ -52,17 +53,40 @@ After setup, click **Configure** on the integration card (or go to **Options**) 
 
 ## How It Works
 
-### AUTO mode (EcoBee-like behaviour)
+### AUTO mode
 
-When the thermostat is in AUTO mode and a comfort preset is active:
+The thermostat maintains a sticky **direction commitment** (HEAT or COOL) that
+flips on demand mismatch, and derives a per-tick **unit command** (HEAT, COOL,
+or OFF) from that direction plus the current inside temperature.
 
-1. If inside temperature **< low setpoint** → switch real device to **HEAT**
-2. If inside temperature **> high setpoint** → switch real device to **COOL**
-3. If inside temperature is **within range**:
-   - With an outside sensor: warm outside → **COOL**; cold outside → **HEAT**
-   - Without an outside sensor: above midpoint → **COOL**; below midpoint → **HEAT**
+- **Initial pick** when entering AUTO: `inside < midpoint → HEAT, otherwise COOL`.
+- **HEAT committed** runs HEAT continuously; the unit modulates to a true
+  compressor idle when no demand.
+- **COOL committed** uses **hysteresis around the band**: starts cooling when
+  current rises above `mid + COOL_RESTART_OFFSET` (default 22.75 °C for the
+  21-23 home preset), stops at `mid` (22 °C).  The 0.25 °C between the
+  restart threshold and the high edge is response-lag headroom — by the time
+  current would otherwise hit the high edge, COOL flow is already pulling
+  the room down.  `hvac_action` reads `idle` while in deliberate-OFF.
+- **Direction flips** on demand mismatch happen via two mechanisms: an
+  immediate **fast-flip** when inside is past the wrong band edge, and a
+  30-min **dwell-flip** for sustained excursions in band.
 
-The real device's setpoint is always kept at the **midpoint** of the active preset range.
+📐 **See [`docs/state-machine.md`](docs/state-machine.md) for the full state
+diagrams, decision flowchart, and design rationale.**
+
+### Problem detection
+
+The wrapper exposes a `problems` extra-state-attribute — a list of detected
+issues (empty list `[]` when healthy).  Conditions checked: inside-sensor
+unavailable / stale, real-device unavailable, sustained out-of-band in AUTO,
+COOL short-cycling.  Use in templates / dashboards:
+
+```jinja
+{% if state_attr('climate.smart_climate', 'problems') %}
+  ⚠ {{ state_attr('climate.smart_climate', 'problems') | join('; ') }}
+{% endif %}
+```
 
 ### Manual mode (PRESET_NONE)
 
@@ -71,7 +95,10 @@ The real device's setpoint is always kept at the **midpoint** of the active pres
 
 ### External changes
 
-If the real device's setpoint is changed externally (e.g., via a physical remote or another automation) by more than 0.5 °C, the smart thermostat automatically switches to **Manual** mode to avoid conflicting with the external change.
+If the real device's setpoint is changed externally (e.g., via a physical
+remote or another automation) by more than 0.5 °C, the smart thermostat
+automatically switches to **Manual** mode to avoid conflicting with the
+external change.
 
 ## Inspiration
 
