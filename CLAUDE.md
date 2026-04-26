@@ -387,17 +387,57 @@ Watch in live deployment:
    straight to high, soft-start isn't engaging; revisit.
 3. **Protection trip codes** in HA logs after the first weeks.
 
-### Implemented behavior (v3.0.0)
+### Implemented behavior (v3.0.0 + v3.0.x hysteresis fixes)
 
-Sticky AUTO commitment from v2.0.0 is unchanged.  The only change
-is in the unit command derived from the committed direction:
+Sticky AUTO commitment from v2.0.0 is unchanged.  The unit command
+derived from the committed direction:
 
-| `_auto_mode` | `current` vs `[low, high]` | Unit command |
-|--------------|---------------------------|--------------|
-| HEAT         | (any)                     | HEAT (v2.0.0 unchanged) |
-| COOL         | in band                   | **OFF** |
-| COOL         | above high                | COOL (v2.0.0) |
-| COOL         | below low                 | COOL (v2.0.0; FLIP_DWELL flips to HEAT) |
+| `_auto_mode` | `current` | Last command | Unit command |
+|--------------|-----------|--------------|--------------|
+| HEAT         | (any)                          | (any)        | HEAT (v2.0.0 unchanged) |
+| COOL         | `> high`                       | (any)        | COOL (v2.0.0) |
+| COOL         | `< low`                        | (any)        | COOL (v2.0.0; FLIP_DWELL → HEAT) |
+| COOL         | in band, `> mid`               | COOL         | COOL (keep cooling to mid) |
+| COOL         | in band, `≤ mid`               | COOL         | OFF |
+| COOL         | in band, `> mid + RESTART_OFF` | OFF / None   | COOL (lead the high edge) |
+| COOL         | in band, `≤ mid + RESTART_OFF` | OFF / None   | OFF |
+
+**In-band COOL hysteresis with offset restart**.  Two sequential
+fixes after the v3.0.0 deploy on 2026-04-26:
+
+1. **Stop at midpoint, not band edge.**  v3.0.0 returned OFF the
+   moment current re-entered `[low, high]` from above.  Live result:
+   2-min COOL pulses with no useful pull.  Fix: keep cooling until
+   `current ≤ mid` so each start does ~½-band of cooling.
+
+2. **Restart leads the high edge.**  Restarting at the high edge
+   (e.g. `> 23` for the [21, 23] home preset) is too late — by the
+   time the wrapper sees current cross 23, the unit's ramp + air-
+   circulation lag has already let the room overshoot.  Fix: restart
+   at `mid + COOL_RESTART_OFFSET` (default 0.75 °C above mid =
+   22.75 for home preset).  COOL flow reaches the sensor before
+   current would otherwise have hit high.
+
+State is keyed on `_unit_command` (the wrapper's last sent command):
+- Was OFF → stay OFF until current rises above `mid + RESTART_OFFSET`
+- Was COOL → stay COOL until current drops to `mid`
+- First sync (`None`) treated as OFF state (don't start uninvited)
+
+The 0.25 °C between restart threshold and high edge is intentional
+headroom for the unit's response lag, *not* unused band.  Tightens
+control vs. starting at the edge, at the cost of more frequent (but
+still meaningful) compressor pulls.
+
+**Requires a sub-degree (decimal) inside-temperature sensor.**  The
+hysteresis depends on resolving values like 22.7 vs. 22.8 to land
+inside the 0.25 °C lead-headroom band between the restart threshold
+and the high edge.  A whole-degree sensor would jump 22 → 23 and
+skip the threshold entirely, defeating the lead and reverting to
+start-at-high (the original short-cycling bug).  This deployment
+uses Aeotec Multisensor 7 sensors (0.1 °C resolution) — fine.  For
+coarser sensors, raise `COOL_RESTART_OFFSET` to at least
+`(sensor_resolution + 0.5 °C)` so the lead headroom is wider than
+one sensor step.
 
 `hvac_action` returns `IDLE` (not `OFF`) on the wrapper whenever
 the unit_command is OFF — distinguishes "AUTO resting" from

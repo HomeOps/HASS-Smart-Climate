@@ -44,6 +44,7 @@ from .const import (
     CONF_REAL_CLIMATE,
     CONF_SLEEP_MAX,
     CONF_SLEEP_MIN,
+    COOL_RESTART_OFFSET,
     DEFAULT_AWAY_MAX,
     DEFAULT_AWAY_MIN,
     DEFAULT_HOME_MAX,
@@ -497,19 +498,31 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         idle in HEAT when the room is at setpoint, so continuous HEAT at
         min modulation costs less than OFF/ON cycling.
 
-        **Committed COOL** — narrow, surgical change vs. v2.0.0.  The
-        *only* deviation from v2.0.0 is in-band:
-        - `current ∈ [low, high]`  →  **OFF** (no work needed)
-        - `current > high`         →  COOL  (v2.0.0)
-        - `current < low`          →  COOL  (v2.0.0; FLIP_DWELL flips
-                                     committed direction to HEAT)
+        **Committed COOL** — narrow, surgical change vs. v2.0.0, with
+        hysteresis above the band midpoint:
+        - currently OFF & `current > mid + COOL_RESTART_OFFSET`  →  COOL  (start)
+        - currently COOL & `current > mid`                       →  COOL  (keep cooling)
+        - currently COOL & `current ≤ mid`                       →  OFF   (stop at mid)
+        - currently OFF & `current ≤ mid + COOL_RESTART_OFFSET`  →  OFF
+        - `current > high`                                       →  COOL  (above-band, always)
+        - `current < low`                                        →  COOL  (v2.0.0 wrong-side;
+                                                                   FLIP_DWELL flips to HEAT)
 
-        Why only here: on this Midea unit the COOL mode holds a minimum-
-        frequency floor and keeps pushing 12-14 °C supply air into rooms
-        that are already in band — diagnosed empirically 2026-04-25.  HEAT
-        does not have this defect, and COOL outside the band still has
-        real demand to chase.  The wrong-side COOL case (below low) is
-        rare and the existing 30-min dwell flip handles it.
+        The hysteresis (start at `mid + COOL_RESTART_OFFSET`, stop at
+        `mid`) prevents short-cycling at the band edge.  With the default
+        home preset (21-23, mid=22, offset=0.75) cooling kicks in at
+        22.75 and pulls down to 22 — leaving the upper 0.25 °C of the
+        comfort band as headroom rather than the active operating zone.
+        Tightens control vs. waiting for the high edge, at the cost of
+        more frequent but still-meaningful compressor pulls.
+
+        Why only COOL needs this: on this Midea unit the COOL mode holds
+        a minimum-frequency floor and keeps pushing 12-14 °C supply air
+        into rooms already in band — diagnosed empirically 2026-04-25.
+        HEAT does not have this defect (refrigerant migrates outdoors
+        when stopped, no slug-on-restart risk), and COOL outside the band
+        still has real demand to chase.  The wrong-side COOL case (below
+        low) is rare and the existing 30-min dwell flip handles it.
         """
         if self._hvac_mode == HVACMode.OFF:
             return HVACMode.OFF
@@ -557,15 +570,29 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             self._pending_flip_since = None
 
         # Unit command — asymmetric between committed directions.
-        # COOL: in-band → OFF; outside band → COOL (matches v2.0.0
-        # everywhere except the in-band case where the Midea min-frequency
-        # floor wastes energy).
         # HEAT: always HEAT (v2.0.0 contract unchanged; the unit modulates
         # to true idle in HEAT when no demand).
+        # COOL: hysteresis above midpoint inside the band, v2.0.0 elsewhere.
+        #   above high                              → COOL (above-band; v2.0.0)
+        #   below low                               → COOL (wrong-side; v2.0.0)
+        #   was COOL, current > mid                 → COOL (keep cooling to mid)
+        #   was COOL, current ≤ mid                 → OFF (full pull achieved)
+        #   was OFF, current > mid + RESTART_OFFSET → COOL (start, lead high edge)
+        #   was OFF, current ≤ mid + RESTART_OFFSET → OFF
+        # The restart offset (default 0.75 °C above mid) leads the high
+        # edge so the compressor has time to ramp before current would
+        # otherwise overshoot the band.  Stopping at midpoint gives each
+        # start a meaningful pull, amortising start-up cost.
         if self._auto_mode == HVACMode.COOL:
-            if low <= inside <= high:
-                return HVACMode.OFF
-            return HVACMode.COOL
+            if inside > high or inside < low:
+                return HVACMode.COOL
+            # Inside the band: hysteresis keyed on the previous command.
+            if self._unit_command == HVACMode.COOL:
+                return HVACMode.COOL if inside > mid else HVACMode.OFF
+            # Was OFF (or first sync) — restart well shy of the high edge.
+            if inside > mid + COOL_RESTART_OFFSET:
+                return HVACMode.COOL
+            return HVACMode.OFF
         return HVACMode.HEAT
 
     # ------------------------------------------------------------------
