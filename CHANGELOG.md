@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.0.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v3.0.0...v3.0.1) (2026-04-26)
+
+
+### Bug Fixes
+
+* add in-band COOL hysteresis (high → mid pull) ([#60](https://github.com/HomeOps/HASS-Smart-Climate/issues/60)) ([a87594a](https://github.com/HomeOps/HASS-Smart-Climate/commit/a87594a0e5cedfa4e843506a7c818ff891629312))
+
 ## [3.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v2.0.0...v3.0.0) (2026-04-26)
 
 
