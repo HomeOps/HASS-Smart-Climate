@@ -489,28 +489,27 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
         In AUTO mode the wrapper maintains a sticky **committed direction**
         (HEAT or COOL) using v2.0.0's FLIP_DWELL/FLIP_MARGIN logic — same
-        as before:
-        - First entry: pick HEAT or COOL based on outside sensor (or
-          inside-vs-midpoint with no outside sensor).  Tie-breaks to COOL.
-        - Subsequent ticks: keep the committed direction; only flip after
-          inside has been past midpoint by FLIP_MARGIN against the committed
-          direction for FLIP_DWELL seconds (with the dead-zone hysteresis
-          that doesn't reset the timer in the buffer area).
+        as before.  The **unit command** sent to the real device is then
+        derived asymmetrically by committed direction:
 
-        The **unit command** sent to the real device is then derived from
-        current vs the comfort band, *regardless* of committed direction:
+        **Committed HEAT** — return HEAT unconditionally (v2.0.0 contract
+        unchanged).  The Midea unit modulates its compressor down to true
+        idle in HEAT when the room is at setpoint, so continuous HEAT at
+        min modulation costs less than OFF/ON cycling.
 
+        **Committed COOL** — narrow, surgical change vs. v2.0.0.  The
+        *only* deviation from v2.0.0 is in-band:
         - `current ∈ [low, high]`  →  **OFF** (no work needed)
-        - committed COOL & `current > high`  →  COOL  (room hot, do work)
-        - committed HEAT & `current < low`   →  HEAT  (room cold, do work)
-        - wrong-side excursion (committed direction opposite to demand)
-          →  OFF, FLIP_DWELL timer counts toward direction flip
+        - `current > high`         →  COOL  (v2.0.0)
+        - `current < low`          →  COOL  (v2.0.0; FLIP_DWELL flips
+                                     committed direction to HEAT)
 
-        This refines v2.0.0's "never OFF in AUTO" rule.  v2.0.0 assumed the
-        underlying device would idle the compressor at min modulation when
-        in band; on Midea inverter heat pumps that's false — they have a
-        minimum-frequency floor and hold the compressor running.  v3 lets
-        the wrapper provide the idle by commanding OFF directly.
+        Why only here: on this Midea unit the COOL mode holds a minimum-
+        frequency floor and keeps pushing 12-14 °C supply air into rooms
+        that are already in band — diagnosed empirically 2026-04-25.  HEAT
+        does not have this defect, and COOL outside the band still has
+        real demand to chase.  The wrong-side COOL case (below low) is
+        rare and the existing 30-min dwell flip handles it.
         """
         if self._hvac_mode == HVACMode.OFF:
             return HVACMode.OFF
@@ -557,18 +556,17 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         elif right_side:
             self._pending_flip_since = None
 
-        # Unit command from current vs band.  OFF inside the band; the
-        # committed direction's active mode only outside the band on the
-        # corresponding side.  Wrong-side excursions return OFF (don't fight
-        # the room while the dwell timer counts toward a flip).
+        # Unit command — asymmetric between committed directions.
+        # COOL: in-band → OFF; outside band → COOL (matches v2.0.0
+        # everywhere except the in-band case where the Midea min-frequency
+        # floor wastes energy).
+        # HEAT: always HEAT (v2.0.0 contract unchanged; the unit modulates
+        # to true idle in HEAT when no demand).
         if self._auto_mode == HVACMode.COOL:
-            if inside > high:
-                return HVACMode.COOL
-            return HVACMode.OFF
-        else:  # HEAT committed
-            if inside < low:
-                return HVACMode.HEAT
-            return HVACMode.OFF
+            if low <= inside <= high:
+                return HVACMode.OFF
+            return HVACMode.COOL
+        return HVACMode.HEAT
 
     # ------------------------------------------------------------------
     # Real-climate synchronisation
