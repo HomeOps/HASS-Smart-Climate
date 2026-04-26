@@ -63,3 +63,11 @@ FLIP_DWELL = 1800  # 30 min
 # 0.1 °C resolution, which is fine.  If you wire a coarser sensor, raise
 # COOL_RESTART_OFFSET to (sensor_resolution + 0.5 °C) or wider.
 COOL_RESTART_OFFSET = 0.75
+
+# Problem-detection thresholds.  Surfaced as the wrapper's `problems`
+# attribute (a list of detected issues, empty when healthy).  Sized
+# generously so transient blips don't fire false alarms; tune down if
+# false-negatives matter more than false-alarms in a given deployment.
+OUT_OF_BAND_ALERT_MINUTES   = 30   # sustained outside [low, high] in AUTO
+SHORT_CYCLE_THRESHOLD_PER_H = 6    # COOL starts/hour above this is "too much"
+SENSOR_STALE_MINUTES        = 15   # no inside-temp update for this long
