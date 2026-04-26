@@ -52,4 +52,14 @@ FLIP_DWELL = 1800  # 30 min
 # rather than the active operating zone.  Tightens control vs. starting
 # at the high edge, at the cost of more frequent (but still meaningful)
 # compressor pulls.
+#
+# REQUIRES a sub-degree (decimal) inside-temperature sensor.  Whole-degree
+# sensors (e.g., a thermostat that reports 22 → 23 → 22) skip over the
+# 22.75 restart threshold entirely and produce alternating jumps from
+# below-restart (OFF) to above-high (COOL) — the 0.25 °C lead-headroom
+# becomes invisible and the wrapper effectively reverts to start-at-high
+# behaviour with all the short-cycling that motivated this fix.  The
+# Aeotec ZW100 / Multisensor 7 family used in this deployment reports
+# 0.1 °C resolution, which is fine.  If you wire a coarser sensor, raise
+# COOL_RESTART_OFFSET to (sensor_resolution + 0.5 °C) or wider.
 COOL_RESTART_OFFSET = 0.75

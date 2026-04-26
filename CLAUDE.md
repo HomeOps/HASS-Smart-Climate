@@ -428,6 +428,17 @@ headroom for the unit's response lag, *not* unused band.  Tightens
 control vs. starting at the edge, at the cost of more frequent (but
 still meaningful) compressor pulls.
 
+**Requires a sub-degree (decimal) inside-temperature sensor.**  The
+hysteresis depends on resolving values like 22.7 vs. 22.8 to land
+inside the 0.25 °C lead-headroom band between the restart threshold
+and the high edge.  A whole-degree sensor would jump 22 → 23 and
+skip the threshold entirely, defeating the lead and reverting to
+start-at-high (the original short-cycling bug).  This deployment
+uses Aeotec Multisensor 7 sensors (0.1 °C resolution) — fine.  For
+coarser sensors, raise `COOL_RESTART_OFFSET` to at least
+`(sensor_resolution + 0.5 °C)` so the lead headroom is wider than
+one sensor step.
+
 `hvac_action` returns `IDLE` (not `OFF`) on the wrapper whenever
 the unit_command is OFF — distinguishes "AUTO resting" from
 "user turned it off entirely".  Implemented via a `_unit_command`
