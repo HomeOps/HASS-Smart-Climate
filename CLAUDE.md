@@ -113,9 +113,13 @@ Real device is **never** commanded OFF in AUTO.
 
 1. **Initial pick** (when no committed mode yet, e.g. AUTO entered fresh
    or after HA restart):
-   - With outside sensor: outside < midpoint → HEAT, otherwise COOL.
-   - Without outside sensor: inside < midpoint → HEAT, otherwise COOL.
-   - Tie at midpoint with no outside sensor → COOL.
+   - **inside < midpoint → HEAT, otherwise COOL** (always; outside is
+     ignored).  Outside sensor remains a valid config option for
+     display / future use, but does not influence the pick.  Empirical
+     reason: in this deployment outside doesn't correlate with the
+     building's thermodynamics, and using it caused the live HEAT-at-23
+     bug on 2026-04-26 (cool outside drove HEAT pick while the room
+     sat at the band's high edge).
 2. **Sticky hold**: the committed mode is kept regardless of where inside
    sits.  The Midea inverter holds the midpoint via its own modulation.
 3. **Flip rule**: HEAT↔COOL only flips when inside has been continuously

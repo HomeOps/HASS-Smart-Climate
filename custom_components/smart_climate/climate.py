@@ -537,12 +537,16 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         low, high = self._active_range()
         mid = (low + high) / 2.0
 
-        # Initial mode pick.
+        # Initial mode pick — inside-vs-midpoint, full stop.  Outside is
+        # NOT consulted: empirically the outside sensor in this
+        # deployment doesn't correlate with the building's thermodynamics
+        # (solar gain, occupancy, internal sources dominate), and using
+        # it caused the live HEAT-at-23 bug on 2026-04-26 where cool
+        # outside drove a HEAT pick while the room sat at the band's
+        # high edge.  FLIP_DWELL (30 min sustained excursion past
+        # mid + FLIP_MARGIN) corrects any wrong pick.
         if self._auto_mode is None:
-            ref: float | None = self._outside_temperature
-            if ref is None or math.isnan(ref):
-                ref = inside
-            self._auto_mode = HVACMode.HEAT if ref < mid else HVACMode.COOL
+            self._auto_mode = HVACMode.HEAT if inside < mid else HVACMode.COOL
             self._pending_flip_since = None
             # fall through to the band-aware unit-command logic below
 
