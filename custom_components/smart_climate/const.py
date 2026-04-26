@@ -71,3 +71,11 @@ COOL_RESTART_OFFSET = 0.75
 OUT_OF_BAND_ALERT_MINUTES   = 30   # sustained outside [low, high] in AUTO
 SHORT_CYCLE_THRESHOLD_PER_H = 6    # COOL starts/hour above this is "too much"
 SENSOR_STALE_MINUTES        = 15   # no inside-temp update for this long
+
+# Command-desync detection: how long we wait for the real device to
+# settle into the wrapper's last commanded state before flagging the
+# divergence as a problem.  60 s is generous — `set_hvac_mode` is
+# fire-and-forget (`blocking=False`), and the real device's
+# soft-start ramp + state-event propagation takes a few seconds even
+# in the happy path.
+COMMAND_GRACE_SECONDS       = 60

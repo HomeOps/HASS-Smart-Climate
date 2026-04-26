@@ -1539,8 +1539,11 @@ class TestProblemDetection:
     def test_healthy_returns_empty_list(self):
         entity, _, _ = self._entity()
         assert entity._detect_problems() == []
-        # And the public attribute echoes the same.
-        assert entity.extra_state_attributes == {"problems": []}
+        # The attribute dict includes problems plus persisted state machine.
+        attrs = entity.extra_state_attributes
+        assert attrs["problems"] == []
+        assert "auto_mode_committed" in attrs
+        assert "last_unit_command" in attrs
 
     def test_inside_sensor_unavailable(self):
         entity, sensor, _ = self._entity(inside_state_value="unavailable")
@@ -1643,6 +1646,57 @@ class TestProblemDetection:
         assert any(p.startswith("inside_sensor_") for p in problems)
         assert "real_climate_unavailable" in problems
 
+    def test_command_desync_within_grace_not_reported(self):
+        """Command just sent — real device hasn't transitioned yet but
+        we're inside the grace window.  No alert."""
+        entity, _, real = self._entity()
+        real.state = "off"  # real device says off
+        entity._unit_command = HVACMode.COOL  # wrapper just commanded cool
+        # 30 seconds ago — within COMMAND_GRACE_SECONDS (60)
+        entity._unit_command_at = entity._now() - datetime.timedelta(seconds=30)
+        assert all(not p.startswith("command_desync") for p in entity._detect_problems())
+
+    def test_command_desync_past_grace_reports(self):
+        """Real device hasn't matched the command after grace window —
+        flag as desync.  Reproduces the 2026-04-26 ghost-HEAT pattern
+        where the wrapper believed it commanded COOL but real device
+        sat in HEAT."""
+        entity, _, real = self._entity()
+        real.state = "heat"
+        entity._unit_command = HVACMode.COOL
+        # Two minutes ago — well past 60s grace
+        entity._unit_command_at = entity._now() - datetime.timedelta(minutes=2)
+        problems = entity._detect_problems()
+        assert any(
+            p == "command_desync:want=cool_got=heat" for p in problems
+        ), problems
+
+    def test_command_desync_real_unavailable_not_reported(self):
+        """Real device unavailable: don't flag desync (already covered
+        by `real_climate_unavailable` and not actionable as desync)."""
+        entity, _, real = self._entity()
+        real.state = "unavailable"
+        entity._unit_command = HVACMode.COOL
+        entity._unit_command_at = entity._now() - datetime.timedelta(minutes=2)
+        assert all(not p.startswith("command_desync") for p in entity._detect_problems())
+
+    def test_command_desync_no_command_yet_not_reported(self):
+        """Wrapper has never sent a command (`_unit_command_at is None`)
+        — no desync to report."""
+        entity, _, real = self._entity()
+        real.state = "heat"
+        entity._unit_command = None
+        entity._unit_command_at = None
+        assert all(not p.startswith("command_desync") for p in entity._detect_problems())
+
+    def test_command_desync_match_not_reported(self):
+        """Real device matches command: no desync."""
+        entity, _, real = self._entity()
+        real.state = "cool"
+        entity._unit_command = HVACMode.COOL
+        entity._unit_command_at = entity._now() - datetime.timedelta(minutes=5)
+        assert all(not p.startswith("command_desync") for p in entity._detect_problems())
+
 
 # ---------------------------------------------------------------------------
 # Unit tests – state restoration on startup
@@ -1658,6 +1712,8 @@ class TestStateRestoration:
         target_temp_low: float = DEFAULT_SLEEP_MIN,
         target_temp_high: float = DEFAULT_SLEEP_MAX,
         temperature: float | None = None,
+        auto_mode_committed: str | None = None,
+        last_unit_command: str | None = None,
     ) -> MagicMock:
         """Build a mock last_state object mimicking HA's RestoreEntity."""
         state = MagicMock()
@@ -1669,6 +1725,10 @@ class TestStateRestoration:
         }
         if temperature is not None:
             attrs["temperature"] = temperature
+        if auto_mode_committed is not None:
+            attrs["auto_mode_committed"] = auto_mode_committed
+        if last_unit_command is not None:
+            attrs["last_unit_command"] = last_unit_command
         state.attributes = attrs
         return state
 
@@ -1822,3 +1882,81 @@ class TestStateRestoration:
             real_climate_temp=25.0,  # wildly divergent setpoint
         )
         assert entity._preset_mode == PRESET_SLEEP
+
+    @pytest.mark.asyncio
+    async def test_auto_mode_committed_restored(self):
+        """`_auto_mode` is restored from last_state.attributes — without
+        this, every HA restart re-runs the initial pick on potentially
+        glitchy post-restart sensor data (the 2026-04-26 ghost-HEAT bug).
+        """
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.AUTO.value,
+            auto_mode_committed=HVACMode.COOL.value,
+        )
+        entity, _ = await self._setup_entity(last_state, inside_temp=22.5)
+        assert entity._auto_mode == HVACMode.COOL
+
+    @pytest.mark.asyncio
+    async def test_last_unit_command_restored(self):
+        """COOL hysteresis state survives restarts: if we were mid-pull
+        (last command COOL), restoration keeps that so the hysteresis
+        doesn't restart from the OFF state."""
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.AUTO.value,
+            auto_mode_committed=HVACMode.COOL.value,
+            last_unit_command=HVACMode.COOL.value,
+        )
+        entity, _ = await self._setup_entity(last_state, inside_temp=22.3)
+        assert entity._unit_command == HVACMode.COOL
+
+    @pytest.mark.asyncio
+    async def test_no_initial_pick_when_committed_restored(self):
+        """When `_auto_mode` is restored, the wrapper must not run the
+        initial-pick logic against current sensor data — the whole
+        point of persistence is to skip that step.
+
+        Set up a scenario that would be a *bad* initial pick (inside
+        21.5, mid 22.5 → would pick HEAT) but with restored COOL.  The
+        wrapper should keep COOL.
+        """
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.AUTO.value,
+            preset_mode=PRESET_HOME,
+            target_temp_low=DEFAULT_HOME_MIN,
+            target_temp_high=DEFAULT_HOME_MAX,
+            auto_mode_committed=HVACMode.COOL.value,
+        )
+        # inside well below mid — would have picked HEAT if uninitialised.
+        entity, _ = await self._setup_entity(
+            last_state, inside_temp=DEFAULT_HOME_MIN + 0.5
+        )
+        assert entity._auto_mode == HVACMode.COOL
+
+    @pytest.mark.asyncio
+    async def test_invalid_committed_value_falls_back_to_none(self):
+        """A garbage `auto_mode_committed` (e.g. an old version's value
+        format) must not crash — fall back to None and the wrapper will
+        do an initial pick on the next sensor tick."""
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.AUTO.value,
+            auto_mode_committed="garbage",
+        )
+        entity, _ = await self._setup_entity(last_state, inside_temp=22.5)
+        assert entity._auto_mode in (None, HVACMode.HEAT, HVACMode.COOL)
+        # Specifically: it MUST NOT be the literal "garbage" string.
+        assert entity._auto_mode != "garbage"
+
+    @pytest.mark.asyncio
+    async def test_extra_attrs_round_trip(self):
+        """Round-trip: save → restore → save should preserve values.
+        Pins the contract that `extra_state_attributes` keys match what
+        `async_added_to_hass` reads."""
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.AUTO.value,
+            auto_mode_committed=HVACMode.COOL.value,
+            last_unit_command=HVACMode.OFF.value,
+        )
+        entity, _ = await self._setup_entity(last_state)
+        attrs = entity.extra_state_attributes
+        assert attrs["auto_mode_committed"] == HVACMode.COOL.value
+        assert attrs["last_unit_command"] == HVACMode.OFF.value

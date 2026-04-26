@@ -488,10 +488,41 @@ Conditions checked:
 | `real_climate_unavailable` / `_missing` | Wrapped climate device is unreachable | immediate |
 | `out_of_band:Nmin` | AUTO can't keep room in band | `OUT_OF_BAND_ALERT_MINUTES` (30) |
 | `short_cycle:N/h` | COOL starts/hour too high | `SHORT_CYCLE_THRESHOLD_PER_H` (6) |
+| `command_desync:want=X_got=Y` | Wrapper commanded `X` but real device is in `Y` past `COMMAND_GRACE_SECONDS` (60) | 60 s |
 
 `out_of_band` only fires in AUTO (manual modes are on the user's
 terms).  `short_cycle` count is a rolling 1-hour window of `OFF→COOL`
 transitions tracked in `_async_sync_real_climate`.
+
+**`command_desync`** catches silent failure to land a command — e.g.
+a `set_hvac_mode` call dropped during a real-device unavailability,
+or the real device deciding for itself.  Only the *change* of
+`_unit_command` resets the grace window; re-issuing the same command
+does not.
+
+### State-machine persistence
+
+The wrapper persists two pieces of state-machine state across HA
+restarts via `extra_state_attributes` (which `RestoreEntity`
+serialises automatically):
+
+- `auto_mode_committed` — the sticky direction (`heat`/`cool`).
+- `last_unit_command` — the wrapper's last commanded mode
+  (`heat`/`cool`/`off`).
+
+`async_added_to_hass` reads both back and rehydrates `_auto_mode`
+and `_unit_command`.  Without persistence, every HA restart re-ran
+the **initial pick** — and on 2026-04-26 the Z-Wave aggregator
+behind `sensor.whole_home_temperature` briefly reported 21.66 °C
+during sensor re-initialisation, committing the wrapper to HEAT for
+30 minutes (until `FLIP_DWELL`) of wrong-direction heating against
+a room that was actually at 22.7 °C.  Persisted state means we keep
+the previously-correct commitment instead of guessing again.
+
+`_pending_flip_since`, `_out_of_band_since`, and `_cool_start_times`
+are *not* persisted — they re-arm naturally from sensor data and
+the worst-case latency on each is acceptable (`FLIP_DWELL` 30 min,
+`OUT_OF_BAND_ALERT_MINUTES` 30 min, short-cycle 1 h window).
 
 `hvac_action` returns `IDLE` (not `OFF`) on the wrapper whenever
 the unit_command is OFF — distinguishes "AUTO resting" from
