@@ -45,6 +45,7 @@ from .const import (
     CONF_REAL_CLIMATE,
     CONF_SLEEP_MAX,
     CONF_SLEEP_MIN,
+    COMMAND_GRACE_SECONDS,
     COOL_RESTART_OFFSET,
     DEFAULT_AWAY_MAX,
     DEFAULT_AWAY_MIN,
@@ -176,6 +177,12 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # frontend distinguishes "AUTO resting" from "user turned it off".
         self._unit_command: HVACMode | None = None
 
+        # Timestamp of the last `_unit_command` change.  Used by the
+        # desync detector to allow the real device a grace period to
+        # transition into the commanded state.  Don't update this on
+        # every sync — only when the command itself changes.
+        self._unit_command_at: datetime.datetime | None = None
+
         # Problem-detection state (surfaced via `problems` attribute).
         # Updated by sensor / sync callbacks; checked at attribute read.
         self._out_of_band_since: datetime.datetime | None = None
@@ -290,13 +297,28 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Surface diagnostic attributes alongside HA's standard ones.
+        """Surface diagnostic + persisted state alongside HA's standard ones.
 
-        ``problems`` is a list of detected issues (empty when healthy).
-        Useful for dashboards and templates: e.g. trigger a notification
-        when ``state_attr('climate.smart_climate', 'problems') | length > 0``.
+        - ``problems`` is a list of detected issues (empty when healthy).
+        - ``auto_mode_committed`` is the sticky direction (`heat`/`cool`)
+          the wrapper has chosen in AUTO mode.  Persisted via RestoreEntity
+          so it survives HA restarts; the wrapper restores it in
+          `async_added_to_hass` to skip the initial pick on potentially
+          glitchy post-restart sensor data.
+        - ``last_unit_command`` is the wrapper's last command to the
+          real device (`heat`/`cool`/`off`).  Persisted for the same
+          reason — keeps COOL hysteresis state continuous across
+          restarts.
         """
-        return {"problems": self._detect_problems()}
+        return {
+            "problems": self._detect_problems(),
+            "auto_mode_committed": (
+                self._auto_mode.value if self._auto_mode else None
+            ),
+            "last_unit_command": (
+                self._unit_command.value if self._unit_command else None
+            ),
+        }
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -329,6 +351,27 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
                 self._target_temp_high = float(attrs[ATTR_TARGET_TEMP_HIGH])
             if ATTR_TEMPERATURE in attrs and attrs[ATTR_TEMPERATURE] is not None:
                 self._target_temperature = float(attrs[ATTR_TEMPERATURE])
+
+            # Restore the AUTO state machine: the sticky committed
+            # direction and the last unit command.  Without this, every
+            # HA restart re-runs the initial pick — and on 2026-04-26
+            # that picked HEAT against a glitchy startup sensor reading
+            # (Z-Wave aggregator briefly reported 21.66 °C while
+            # sensors were re-initialising), committing the wrapper to
+            # 30 minutes of wrong-direction heating.  Persisting these
+            # across restarts keeps the state machine stable.
+            committed = attrs.get("auto_mode_committed")
+            if committed:
+                try:
+                    self._auto_mode = HVACMode(committed)
+                except ValueError:
+                    self._auto_mode = None
+            last_cmd = attrs.get("last_unit_command")
+            if last_cmd:
+                try:
+                    self._unit_command = HVACMode(last_cmd)
+                except ValueError:
+                    self._unit_command = None
 
         # Populate initial state from current entity states
         self._sync_from_real_climate()
@@ -576,6 +619,30 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         if recent > SHORT_CYCLE_THRESHOLD_PER_H:
             problems.append(f"short_cycle:{recent}/h")
 
+        # Command desync.  We track the wrapper's last commanded state
+        # (`_unit_command`) and the timestamp of the last *change*.  If
+        # more than COMMAND_GRACE_SECONDS have passed since the change
+        # AND the real device's state still doesn't match what the
+        # wrapper believes it commanded, surface that — silently
+        # diverging state is the failure mode that produced the
+        # 2026-04-26 ghost-HEAT incident.  We compare against
+        # `_unit_command.value` (e.g. "cool") which is what the real
+        # device's state should read.  The check skips when the real
+        # device is unavailable (already covered by another problem
+        # code) or when no command has been sent yet.
+        if (
+            self._unit_command is not None
+            and self._unit_command_at is not None
+            and real_state is not None
+            and real_state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN, None, "")
+        ):
+            elapsed = (now - self._unit_command_at).total_seconds()
+            if elapsed > COMMAND_GRACE_SECONDS:
+                expected = self._unit_command.value
+                actual = real_state.state
+                if expected != actual:
+                    problems.append(f"command_desync:want={expected}_got={actual}")
+
         return problems
 
     def _desired_real_mode(self) -> HVACMode:
@@ -736,6 +803,11 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             and self._unit_command != HVACMode.COOL
         ):
             self._cool_start_times.append(self._now())
+        # Track command changes for desync detection (only when the
+        # command actually changes — re-issuing the same command
+        # shouldn't reset the grace window).
+        if real_mode != self._unit_command:
+            self._unit_command_at = self._now()
         # Record the wrapper's intent so hvac_action can surface IDLE for
         # deliberate-OFF (AUTO + OFF inside the comfort band) without
         # re-running _desired_real_mode (which has timer side-effects).
