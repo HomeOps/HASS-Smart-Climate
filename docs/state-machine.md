@@ -26,7 +26,7 @@ genuine demand mismatch — by one of two mechanisms:
 stateDiagram-v2
     direction LR
     [*] --> Uninitialized: __init__\n/ leave AUTO
-    Uninitialized --> HEAT: inside &lt; mid
+    Uninitialized --> HEAT: inside < mid
     Uninitialized --> COOL: inside ≥ mid
 
     HEAT --> COOL: fast-flip\n(inside &gt; high)
