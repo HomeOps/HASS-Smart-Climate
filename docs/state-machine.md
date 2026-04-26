@@ -29,8 +29,8 @@ stateDiagram-v2
     Uninitialized --> HEAT: inside < mid
     Uninitialized --> COOL: inside ≥ mid
 
-    HEAT --> COOL: fast-flip\n(inside &gt; high)
-    COOL --> HEAT: fast-flip\n(inside &lt; low)
+    HEAT --> COOL: fast-flip\n(inside > high)
+    COOL --> HEAT: fast-flip\n(inside < low)
 
     HEAT --> COOL: dwell-flip\n(inside ≥ mid + FLIP_MARGIN\nfor FLIP_DWELL = 30 min)
     COOL --> HEAT: dwell-flip\n(inside ≤ mid − FLIP_MARGIN\nfor FLIP_DWELL = 30 min)
