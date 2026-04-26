@@ -329,16 +329,63 @@ capacity even when temperature setpoint is met.
 ### Why HEAT does NOT need this fix
 
 Tested 2026-04-26 with HEAT in AUTO + room in band: **the unit
-properly idled its compressor**.  HEAT mode has no equivalent
-"always-on for dehumidification" reason to hold a min-frequency
-floor — humidity isn't being managed there.  HEAT mode also runs
-defrost cycles and other ambient-management logic that already
-includes true compressor idle as a steady state.
+properly idled its compressor**.
+
+The asymmetry is most likely **refrigerant-cycle direction**, not
+dehumidification.  An early hypothesis blamed COOL min-freq on
+internal humidity logic — the unit has a separate selectable Dry
+mode, COOL-only, which seemed to fit.  But Dry mode is *off* and
+COOL still floors, so dehumidification can't be the active driver.
+
+Better theory: in COOL the indoor coil is the cold sink, so when
+the compressor stops, refrigerant migrates to it.  On the next
+restart that liquid refrigerant can return to the compressor as a
+slug → bearing wear or shutdown.  Holding a minimum frequency
+prevents migration.  HEAT reverses the cycle (indoor coil is the
+hot side), so refrigerant migrates outdoors when stopped — benign,
+no slug risk on restart.  Compressor protection logic only needs
+to forbid full idle in COOL.
+
+The Dry-mode-COOL-only pairing is then explained simply by
+thermodynamics: dehumidification requires a cold coil to condense
+moisture, and only COOL gives you that.  It's not evidence about
+*how* COOL is controlled.
 
 So v2.0.0's "never command OFF" rule is *correct* for HEAT
-(start-up cost > min-freq idle cost) and *wrong* for COOL on this
-unit (min-freq pumps unwanted cold air).  v3 makes the correction
-asymmetric to match.
+(start-up cost > min-freq idle cost, no protection penalty) and
+*wrong* for COOL on this unit (min-freq pumps unwanted cold air).
+v3 makes the correction asymmetric to match.
+
+### Risk assessment
+
+Damage risk from cycling COOL on/off is **low**:
+
+- We use the manufacturer's `set_hvac_mode` service.  The unit's
+  firmware runs its own shutdown sequence (pump-down, valve
+  positioning) and startup sequence (soft-start ramp from low
+  frequency).  We're not yanking power.
+- Modern inverter units have built-in anti-short-cycle protection.
+  If the wrapper commands COOL within ~3-5 min of an OFF, the unit
+  queues the request internally.
+- Inverter compressors are far more cycle-tolerant than single-
+  stage; soft-start makes each cycle cheap in wear terms.
+- The OFF command we send is identical to what happens when a user
+  presses OFF on the wired thermostat — a normal manufacturer-
+  designed transition.
+
+Cumulative wear from extra cycling is real but minor (≈30 s of
+equivalent steady-state runtime per start).  The 2 °C band width
+in the Home preset should comfortably keep cycles under 2/hour in
+practice.
+
+Watch in live deployment:
+
+1. **Cycle frequency.** > 6 starts/hour sustained → add
+   `OFF_HOLD_UP` (Future Work #2 below).
+2. **Compressor restart frequency curve.** Healthy restart starts
+   low and ramps over ~30-60 s.  If `compressor_freq` jumps
+   straight to high, soft-start isn't engaging; revisit.
+3. **Protection trip codes** in HA logs after the first weeks.
 
 ### Implemented behavior (v3.0.0)
 
@@ -396,7 +443,37 @@ edges (sub-10-minute on/off cycles), add:
   re-arming COOL.  Prevents re-starting the compressor the moment
   current grazes the high edge.
 
-### 3. Wide-deadband HEAT (DEFERRED — empirically not needed)
+### 3. OFF on wrong-side COOL excursion (CANDIDATE)
+
+v3.0.0 deliberately keeps v2.0.0 behavior in the wrong-side COOL
+case: COOL committed + current < low → send COOL (and let
+`FLIP_DWELL` flip the committed direction to HEAT after 30 min).
+Per user direction at PR time: *"OFF only when tending to cool
+inside the band"*.
+
+The downside surfaces on cool spring/fall nights after a warm day:
+AUTO is still committed COOL from the afternoon, the room drifts
+below low overnight, and the wrapper sends COOL into a cold room
+for up to 30 minutes before the dwell-flip kicks in.  Empirically
+small (the unit modulates and the room is already cold so the
+gradient is small), but visible in logs.
+
+If this turns out to matter in the live deployment, the surgical
+fix is:
+
+```python
+if self._auto_mode == HVACMode.COOL:
+    if low <= inside <= high:
+        return HVACMode.OFF
+    if inside < low:           # NEW: don't fight the room
+        return HVACMode.OFF
+    return HVACMode.COOL
+```
+
+Decision deferred until we have overnight data showing the
+behavior is actually a problem.
+
+### 4. Wide-deadband HEAT (DEFERRED — empirically not needed)
 
 Originally proposed as a mirror of the COOL trigger.  Live testing
 2026-04-26 showed HEAT properly idles, so this is not implemented
