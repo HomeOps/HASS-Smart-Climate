@@ -162,23 +162,26 @@ class TestDesiredRealMode:
         entity._auto_mode = HVACMode.COOL
         assert entity._desired_real_mode() == HVACMode.COOL
 
-    def test_initial_pick_uses_outside_when_cold(self):
-        """Outside sensor decides the first commitment: cold → HEAT.
+    def test_initial_pick_ignores_outside_sensor(self):
+        """Outside is NOT consulted for the initial pick.
 
-        v3: in-band current returns OFF as the unit command, but the
-        commitment side-effect on _auto_mode still fires.
+        Empirically the outside sensor in this deployment doesn't
+        correlate with the building's thermodynamics (solar gain,
+        occupancy, internal sources dominate).  Using outside caused
+        the 2026-04-26 HEAT-at-23 bug where cool outside drove a HEAT
+        pick while the room sat at the band's high edge.  Whatever
+        outside reads, only inside-vs-mid decides.
         """
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MIN - 5)
-        entity._desired_real_mode()
-        assert entity._auto_mode == HVACMode.HEAT
+        # Inside above mid, outside very cold → still COOL (inside wins).
+        e_hot_inside = self._entity(inside=mid + 0.1, outside=mid - 20)
+        e_hot_inside._desired_real_mode()
+        assert e_hot_inside._auto_mode == HVACMode.COOL
 
-    def test_initial_pick_uses_outside_when_warm(self):
-        """Outside sensor decides the first commitment: warm → COOL."""
-        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
-        entity = self._entity(inside=mid, outside=DEFAULT_HOME_MAX + 5)
-        entity._desired_real_mode()
-        assert entity._auto_mode == HVACMode.COOL
+        # Inside below mid, outside very warm → still HEAT.
+        e_cold_inside = self._entity(inside=mid - 0.1, outside=mid + 20)
+        e_cold_inside._desired_real_mode()
+        assert e_cold_inside._auto_mode == HVACMode.HEAT
 
     def test_initial_pick_falls_back_to_inside_when_no_outside(self):
         """No outside sensor: inside-vs-midpoint chooses initial mode."""
@@ -196,6 +199,55 @@ class TestDesiredRealMode:
         entity = self._entity(inside=mid)
         entity._desired_real_mode()
         assert entity._auto_mode == HVACMode.COOL
+
+    def test_initial_pick_inside_demand_overrides_cold_outside(self):
+        """Regression 2026-04-26: cool outside + hot inside must commit COOL.
+
+        Live bug: PNW cool spring night (~13 °C outside) with room at
+        the high edge of the band (23 °C, inside the [21, 23] preset)
+        committed AUTO to HEAT because outside was below mid.  HEAT then
+        ran unconditionally for FLIP_DWELL (30 min) before flipping to
+        COOL — actively heating a room that wanted cooling.
+
+        Fix: inside-temp demand past `mid ± FLIP_MARGIN` wins over
+        outside.  Outside is a tiebreaker only for the indeterminate
+        near-midpoint case.
+        """
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        # Inside well past mid+FLIP_MARGIN, outside cold.
+        entity = self._entity(inside=mid + FLIP_MARGIN, outside=mid - 10)
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL, (
+            "inside ≥ mid + FLIP_MARGIN must commit COOL despite cold "
+            "outside — otherwise the wrapper heats a room that wants cooling"
+        )
+
+    def test_initial_pick_inside_demand_overrides_warm_outside(self):
+        """Mirror: cold inside + warm outside must commit HEAT."""
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        entity = self._entity(inside=mid - FLIP_MARGIN, outside=mid + 10)
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.HEAT
+
+    def test_outside_sensor_config_still_accepted_but_ignored(self):
+        """Outside-sensor config remains valid (no config-flow break).
+
+        Users with CONF_OUTSIDE_SENSOR set in existing installs keep
+        working; the wrapper accepts the config and reads the sensor,
+        but the value is no longer consulted by the initial-pick
+        logic.  Future features (free-cooling detection, forecast-
+        driven preconditioning) may re-introduce its use.
+        """
+        mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
+        # Same inside, two wildly different outside readings: identical pick.
+        e1 = self._entity(inside=mid - 0.1, outside=mid - 20)
+        e1._desired_real_mode()
+        e2 = self._entity(inside=mid - 0.1, outside=mid + 20)
+        e2._desired_real_mode()
+        assert e1._auto_mode == e2._auto_mode == HVACMode.HEAT
+        # Outside is still tracked for display / future use.
+        assert e1._outside_temperature == mid - 20
+        assert e2._outside_temperature == mid + 20
 
     def test_auto_below_low_picks_heat(self):
         """Way below the band — initial pick is HEAT and unit runs HEAT."""
