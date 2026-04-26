@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v2.0.0...v3.0.0) (2026-04-26)
+
+
+### ⚠ BREAKING CHANGES
+
+* AUTO mode now commands the real device OFF when the current temperature is inside the comfort band. Downstream automations that assumed AUTO would never produce hvac_mode='off' on the wrapped entity must be updated.
+
+### Features
+
+* command OFF in AUTO+COOL when current is in band ([#58](https://github.com/HomeOps/HASS-Smart-Climate/issues/58)) ([e3f7412](https://github.com/HomeOps/HASS-Smart-Climate/commit/e3f7412a30d7bf576b9c6691fcaaa8433f3f5e8a))
+
 ## [2.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v1.0.3...v2.0.0) (2026-04-25)
 
 
