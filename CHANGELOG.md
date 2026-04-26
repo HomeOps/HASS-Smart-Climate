@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.0.2](https://github.com/HomeOps/HASS-Smart-Climate/compare/v3.0.1...v3.0.2) (2026-04-26)
+
+
+### Bug Fixes
+
+* ignore outside sensor in AUTO initial pick ([#62](https://github.com/HomeOps/HASS-Smart-Climate/issues/62)) ([b999453](https://github.com/HomeOps/HASS-Smart-Climate/commit/b999453e8e9b43096cb066caf71036697753885b))
+
 ## [3.0.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v3.0.0...v3.0.1) (2026-04-26)
 
 
