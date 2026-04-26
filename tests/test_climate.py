@@ -329,6 +329,118 @@ class TestAutoCoolOffInBand:
         assert entity._desired_real_mode() == HVACMode.COOL
 
 
+class TestAutoCoolHysteresis:
+    """In-band hysteresis for AUTO + COOL.
+
+    v3.0.0 used a flat threshold at the band edge — the wrapper short-
+    cycled because crossing into the band by 0.1 °C immediately
+    commanded OFF after only ~2 min of useful cooling.  Deployed
+    2026-04-26 and observed live: a 2-minute COOL pulse at 23.0 °C.
+
+    Fix: keep cooling until current drops to the midpoint, then OFF;
+    don't restart until current rises back above high.  Each
+    compressor start now does ~½-band of useful work before stopping,
+    amortising the start-up cost over a meaningful pull.
+    """
+
+    def _entity(self, inside, low=21.0, high=23.0,
+                last_cmd=None, committed=HVACMode.COOL):
+        hass = _make_hass_mock(inside_temp=inside)
+        config = {
+            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
+            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
+        }
+        entity = _make_entity(hass, config)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = inside
+        entity._preset_ranges[PRESET_HOME] = (low, high)
+        entity._auto_mode = committed
+        entity._unit_command = last_cmd
+        return entity
+
+    def test_keeps_cooling_above_midpoint(self):
+        """COOL state, current still above mid → keep cooling.
+
+        Reproduces the live bug: at 23.0 °C with COOL just sent, v3.0.0
+        flipped to OFF immediately.  Hysteresis says keep going to mid.
+        """
+        for inside in (22.99, 22.5, 22.1):
+            entity = self._entity(inside=inside, last_cmd=HVACMode.COOL)
+            assert entity._desired_real_mode() == HVACMode.COOL, (
+                f"COOL state at {inside} (>mid=22): expected COOL, "
+                f"got {entity._desired_real_mode()}"
+            )
+
+    def test_stops_at_midpoint(self):
+        """COOL state, current ≤ mid → OFF (compressor stops)."""
+        for inside in (22.0, 21.9, 21.5, 21.0):
+            entity = self._entity(inside=inside, last_cmd=HVACMode.COOL)
+            assert entity._desired_real_mode() == HVACMode.OFF, (
+                f"COOL state at {inside} (≤mid=22): expected OFF, "
+                f"got {entity._desired_real_mode()}"
+            )
+
+    def test_off_state_does_not_restart_in_band(self):
+        """OFF state, current still ≤ high → stay OFF (no restart).
+
+        This is the other half of the hysteresis: once OFF, the wrapper
+        does not restart COOL until current rises above the high edge.
+        """
+        for inside in (21.0, 22.0, 22.9, 23.0):
+            entity = self._entity(inside=inside, last_cmd=HVACMode.OFF)
+            assert entity._desired_real_mode() == HVACMode.OFF, (
+                f"OFF state at {inside} (≤high=23): expected OFF, "
+                f"got {entity._desired_real_mode()}"
+            )
+
+    def test_off_state_restarts_above_high(self):
+        """OFF state, current > high → start COOL."""
+        for inside in (23.01, 23.5, 24.0):
+            entity = self._entity(inside=inside, last_cmd=HVACMode.OFF)
+            assert entity._desired_real_mode() == HVACMode.COOL
+
+    def test_first_sync_with_no_prior_command_treats_as_off_state(self):
+        """`_unit_command is None` (first sync) behaves like OFF state:
+        in band → stay OFF; above high → COOL."""
+        e_in_band = self._entity(inside=22.5, last_cmd=None)
+        assert e_in_band._desired_real_mode() == HVACMode.OFF
+        e_above = self._entity(inside=24.0, last_cmd=None)
+        assert e_above._desired_real_mode() == HVACMode.COOL
+
+    def test_full_pull_cycle_minimum_two_starts_per_full_cycle(self):
+        """End-to-end: simulate temp 24 → 22 → 24 → 22 with the wrapper
+        tracking _unit_command.  Verify exactly one COOL start per
+        full cycle (not two from short-cycling at 23)."""
+        # Cycle 1: 24 → start COOL
+        e = self._entity(inside=24.0, last_cmd=HVACMode.OFF)
+        assert e._desired_real_mode() == HVACMode.COOL
+        e._unit_command = HVACMode.COOL  # simulate sync committed COOL
+
+        # Drift down through band — must stay COOL until mid
+        for t in (23.5, 23.0, 22.5, 22.1):
+            e._current_temperature = t
+            assert e._desired_real_mode() == HVACMode.COOL, (
+                f"COOL state at {t} should stay COOL"
+            )
+
+        # Hit mid → OFF
+        e._current_temperature = 22.0
+        assert e._desired_real_mode() == HVACMode.OFF
+        e._unit_command = HVACMode.OFF
+
+        # Drift around in band — must stay OFF
+        for t in (21.5, 22.0, 22.5, 23.0):
+            e._current_temperature = t
+            assert e._desired_real_mode() == HVACMode.OFF, (
+                f"OFF state at {t} (in band) should stay OFF"
+            )
+
+        # Climb above high → COOL again (one start, not many)
+        e._current_temperature = 23.1
+        assert e._desired_real_mode() == HVACMode.COOL
+
+
 class TestAutoHeatNeverOff:
     """HEAT in AUTO retains v2.0.0's "never command OFF" contract.
 

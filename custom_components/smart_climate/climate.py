@@ -497,19 +497,28 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         idle in HEAT when the room is at setpoint, so continuous HEAT at
         min modulation costs less than OFF/ON cycling.
 
-        **Committed COOL** — narrow, surgical change vs. v2.0.0.  The
-        *only* deviation from v2.0.0 is in-band:
-        - `current ∈ [low, high]`  →  **OFF** (no work needed)
-        - `current > high`         →  COOL  (v2.0.0)
-        - `current < low`          →  COOL  (v2.0.0; FLIP_DWELL flips
-                                     committed direction to HEAT)
+        **Committed COOL** — narrow, surgical change vs. v2.0.0, with
+        hysteresis around the band edges:
+        - currently OFF & `current > high`  →  COOL  (start cooling)
+        - currently COOL & `current > mid`  →  COOL  (keep cooling)
+        - currently COOL & `current ≤ mid`  →  OFF   (stop at midpoint)
+        - currently OFF & `current ≤ high`  →  OFF
+        - `current < low`                   →  COOL  (v2.0.0; FLIP_DWELL
+                                              flips committed dir to HEAT)
 
-        Why only here: on this Midea unit the COOL mode holds a minimum-
-        frequency floor and keeps pushing 12-14 °C supply air into rooms
-        that are already in band — diagnosed empirically 2026-04-25.  HEAT
-        does not have this defect, and COOL outside the band still has
-        real demand to chase.  The wrong-side COOL case (below low) is
-        rare and the existing 30-min dwell flip handles it.
+        The hysteresis (start above high, stop at midpoint) is what
+        prevents short-cycling: a flat threshold at the band edge would
+        OFF after a fraction of a degree of cooling.  Going down to mid
+        gives each compressor start ~½-band of useful cooling before
+        stopping, amortising start-up cost.
+
+        Why only COOL needs this: on this Midea unit the COOL mode holds
+        a minimum-frequency floor and keeps pushing 12-14 °C supply air
+        into rooms already in band — diagnosed empirically 2026-04-25.
+        HEAT does not have this defect (refrigerant migrates outdoors
+        when stopped, no slug-on-restart risk), and COOL outside the band
+        still has real demand to chase.  The wrong-side COOL case (below
+        low) is rare and the existing 30-min dwell flip handles it.
         """
         if self._hvac_mode == HVACMode.OFF:
             return HVACMode.OFF
@@ -557,15 +566,24 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             self._pending_flip_since = None
 
         # Unit command — asymmetric between committed directions.
-        # COOL: in-band → OFF; outside band → COOL (matches v2.0.0
-        # everywhere except the in-band case where the Midea min-frequency
-        # floor wastes energy).
         # HEAT: always HEAT (v2.0.0 contract unchanged; the unit modulates
         # to true idle in HEAT when no demand).
+        # COOL: hysteresis inside the band, v2.0.0 elsewhere.
+        #   above high           → COOL (real demand; v2.0.0)
+        #   below low            → COOL (wrong-side; v2.0.0; FLIP_DWELL flips)
+        #   in band, was COOL    → COOL until current ≤ mid, then OFF
+        #   in band, was OFF     → OFF until current > high
+        # The hysteresis prevents short-cycling at the high edge: a flat
+        # threshold would OFF after a fraction of a degree of cooling.
+        # Stopping at the midpoint gives each compressor start ~½-band of
+        # useful pull before stopping, amortising the start-up cost.
         if self._auto_mode == HVACMode.COOL:
-            if low <= inside <= high:
-                return HVACMode.OFF
-            return HVACMode.COOL
+            if inside > high or inside < low:
+                return HVACMode.COOL
+            # Inside the band: hysteresis keyed on the previous command.
+            if self._unit_command == HVACMode.COOL and inside > mid:
+                return HVACMode.COOL
+            return HVACMode.OFF
         return HVACMode.HEAT
 
     # ------------------------------------------------------------------

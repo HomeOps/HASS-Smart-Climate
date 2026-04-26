@@ -387,17 +387,32 @@ Watch in live deployment:
    straight to high, soft-start isn't engaging; revisit.
 3. **Protection trip codes** in HA logs after the first weeks.
 
-### Implemented behavior (v3.0.0)
+### Implemented behavior (v3.0.0 + v3.0.x hysteresis fix)
 
-Sticky AUTO commitment from v2.0.0 is unchanged.  The only change
-is in the unit command derived from the committed direction:
+Sticky AUTO commitment from v2.0.0 is unchanged.  The unit command
+derived from the committed direction:
 
-| `_auto_mode` | `current` vs `[low, high]` | Unit command |
-|--------------|---------------------------|--------------|
-| HEAT         | (any)                     | HEAT (v2.0.0 unchanged) |
-| COOL         | in band                   | **OFF** |
-| COOL         | above high                | COOL (v2.0.0) |
-| COOL         | below low                 | COOL (v2.0.0; FLIP_DWELL flips to HEAT) |
+| `_auto_mode` | `current` vs `[low, high]` | Last command | Unit command |
+|--------------|---------------------------|--------------|--------------|
+| HEAT         | (any)                     | (any)        | HEAT (v2.0.0 unchanged) |
+| COOL         | above high                | (any)        | COOL (v2.0.0) |
+| COOL         | below low                 | (any)        | COOL (v2.0.0; FLIP_DWELL flips to HEAT) |
+| COOL         | in band, > mid            | COOL         | COOL (keep cooling to mid) |
+| COOL         | in band, ≤ mid            | COOL         | OFF |
+| COOL         | in band                   | OFF / None   | OFF |
+
+**In-band COOL hysteresis** added in v3.0.x.  v3.0.0 used a flat
+threshold at the band edge; live deployment 2026-04-26 caught the
+short-cycling — temp hit 23.0, COOL ran for 2 minutes, OFF as soon
+as it dropped back into band.  No useful pull, just compressor
+start + immediate stop.  The hysteresis (start above high, stop at
+midpoint) ensures each compressor start does ~½-band of useful
+cooling before stopping, amortising start-up cost.
+
+State is keyed on `_unit_command` (the wrapper's last sent command):
+- Was OFF → stay OFF until current rises above high
+- Was COOL → stay COOL until current drops to midpoint
+- First sync (`None`) treated as OFF state (don't start uninvited)
 
 `hvac_action` returns `IDLE` (not `OFF`) on the wrapper whenever
 the unit_command is OFF — distinguishes "AUTO resting" from
