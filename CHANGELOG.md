@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.1.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v3.0.2...v3.1.0) (2026-04-26)
+
+
+### Features
+
+* fast-flip on band-edge violation + problems attribute ([#64](https://github.com/HomeOps/HASS-Smart-Climate/issues/64)) ([e7f4829](https://github.com/HomeOps/HASS-Smart-Climate/commit/e7f482912099a18cca5a0c7344a2b3acf202ab78))
+
 ## [3.0.2](https://github.com/HomeOps/HASS-Smart-Climate/compare/v3.0.1...v3.0.2) (2026-04-26)
 
 
