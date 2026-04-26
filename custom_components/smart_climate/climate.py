@@ -44,6 +44,7 @@ from .const import (
     CONF_REAL_CLIMATE,
     CONF_SLEEP_MAX,
     CONF_SLEEP_MIN,
+    COOL_RESTART_OFFSET,
     DEFAULT_AWAY_MAX,
     DEFAULT_AWAY_MIN,
     DEFAULT_HOME_MAX,
@@ -498,19 +499,22 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         min modulation costs less than OFF/ON cycling.
 
         **Committed COOL** — narrow, surgical change vs. v2.0.0, with
-        hysteresis around the band edges:
-        - currently OFF & `current > high`  →  COOL  (start cooling)
-        - currently COOL & `current > mid`  →  COOL  (keep cooling)
-        - currently COOL & `current ≤ mid`  →  OFF   (stop at midpoint)
-        - currently OFF & `current ≤ high`  →  OFF
-        - `current < low`                   →  COOL  (v2.0.0; FLIP_DWELL
-                                              flips committed dir to HEAT)
+        hysteresis above the band midpoint:
+        - currently OFF & `current > mid + COOL_RESTART_OFFSET`  →  COOL  (start)
+        - currently COOL & `current > mid`                       →  COOL  (keep cooling)
+        - currently COOL & `current ≤ mid`                       →  OFF   (stop at mid)
+        - currently OFF & `current ≤ mid + COOL_RESTART_OFFSET`  →  OFF
+        - `current > high`                                       →  COOL  (above-band, always)
+        - `current < low`                                        →  COOL  (v2.0.0 wrong-side;
+                                                                   FLIP_DWELL flips to HEAT)
 
-        The hysteresis (start above high, stop at midpoint) is what
-        prevents short-cycling: a flat threshold at the band edge would
-        OFF after a fraction of a degree of cooling.  Going down to mid
-        gives each compressor start ~½-band of useful cooling before
-        stopping, amortising start-up cost.
+        The hysteresis (start at `mid + COOL_RESTART_OFFSET`, stop at
+        `mid`) prevents short-cycling at the band edge.  With the default
+        home preset (21-23, mid=22, offset=0.75) cooling kicks in at
+        22.75 and pulls down to 22 — leaving the upper 0.25 °C of the
+        comfort band as headroom rather than the active operating zone.
+        Tightens control vs. waiting for the high edge, at the cost of
+        more frequent but still-meaningful compressor pulls.
 
         Why only COOL needs this: on this Midea unit the COOL mode holds
         a minimum-frequency floor and keeps pushing 12-14 °C supply air
@@ -568,20 +572,25 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # Unit command — asymmetric between committed directions.
         # HEAT: always HEAT (v2.0.0 contract unchanged; the unit modulates
         # to true idle in HEAT when no demand).
-        # COOL: hysteresis inside the band, v2.0.0 elsewhere.
-        #   above high           → COOL (real demand; v2.0.0)
-        #   below low            → COOL (wrong-side; v2.0.0; FLIP_DWELL flips)
-        #   in band, was COOL    → COOL until current ≤ mid, then OFF
-        #   in band, was OFF     → OFF until current > high
-        # The hysteresis prevents short-cycling at the high edge: a flat
-        # threshold would OFF after a fraction of a degree of cooling.
-        # Stopping at the midpoint gives each compressor start ~½-band of
-        # useful pull before stopping, amortising the start-up cost.
+        # COOL: hysteresis above midpoint inside the band, v2.0.0 elsewhere.
+        #   above high                              → COOL (above-band; v2.0.0)
+        #   below low                               → COOL (wrong-side; v2.0.0)
+        #   was COOL, current > mid                 → COOL (keep cooling to mid)
+        #   was COOL, current ≤ mid                 → OFF (full pull achieved)
+        #   was OFF, current > mid + RESTART_OFFSET → COOL (start, lead high edge)
+        #   was OFF, current ≤ mid + RESTART_OFFSET → OFF
+        # The restart offset (default 0.75 °C above mid) leads the high
+        # edge so the compressor has time to ramp before current would
+        # otherwise overshoot the band.  Stopping at midpoint gives each
+        # start a meaningful pull, amortising start-up cost.
         if self._auto_mode == HVACMode.COOL:
             if inside > high or inside < low:
                 return HVACMode.COOL
             # Inside the band: hysteresis keyed on the previous command.
-            if self._unit_command == HVACMode.COOL and inside > mid:
+            if self._unit_command == HVACMode.COOL:
+                return HVACMode.COOL if inside > mid else HVACMode.OFF
+            # Was OFF (or first sync) — restart well shy of the high edge.
+            if inside > mid + COOL_RESTART_OFFSET:
                 return HVACMode.COOL
             return HVACMode.OFF
         return HVACMode.HEAT

@@ -20,6 +20,7 @@ from custom_components.smart_climate.const import (
     CONF_REAL_CLIMATE,
     CONF_INSIDE_SENSOR,
     CONF_OUTSIDE_SENSOR,
+    COOL_RESTART_OFFSET,
     DEFAULT_HOME_MIN,
     DEFAULT_HOME_MAX,
     DEFAULT_SLEEP_MIN,
@@ -216,14 +217,17 @@ class TestDesiredRealMode:
         let FLIP_DWELL flip the direction).
         """
         low, high = DEFAULT_HOME_MIN, DEFAULT_HOME_MAX
-
-        # Committed COOL + in band → OFF (the only deviation from v2.0.0)
-        for inside in [low, low + 0.5, (low + high) / 2, high - 0.5, high]:
+        mid = (low + high) / 2
+        # Below the COOL restart threshold (mid + COOL_RESTART_OFFSET): OFF.
+        # Above it but in band: hysteresis would START cooling — see
+        # TestAutoCoolHysteresis for that side.
+        for inside in [low, low + 0.5, mid]:
             entity = self._entity(inside=inside)
             entity._auto_mode = HVACMode.COOL
             assert entity._desired_real_mode() == HVACMode.OFF, (
-                f"COOL committed, current={inside} in [{low},{high}]: "
-                f"expected OFF, got {entity._desired_real_mode()}"
+                f"COOL committed, current={inside} below restart "
+                f"threshold {mid + COOL_RESTART_OFFSET}: expected OFF, "
+                f"got {entity._desired_real_mode()}"
             )
 
         # Committed HEAT + in band → HEAT (v2.0.0 unchanged; unit modulates)
@@ -306,11 +310,21 @@ class TestAutoCoolOffInBand:
                 f"frequency floor wastes energy in band."
             )
 
-    def test_cool_in_band_yields_off(self):
-        """Point-tests across the band edges and midpoint, COOL committed."""
-        for inside in (21.0, 21.5, 22.0, 22.5, 23.0):
+    def test_cool_in_band_below_restart_threshold_yields_off(self):
+        """COOL committed, current ≤ mid + COOL_RESTART_OFFSET, OFF state.
+
+        Hysteresis-aware: in this regime the wrapper holds OFF until the
+        restart threshold (default 0.75 °C above mid) is exceeded.  The
+        upper sliver between threshold and high is the "start cooling"
+        zone (covered by TestAutoCoolHysteresis) and not OFF here.
+        """
+        # Band [21, 23], mid=22, restart threshold=22.75
+        for inside in (21.0, 21.5, 22.0, 22.5, 22.75):
             entity = self._entity(inside=inside, committed=HVACMode.COOL)
-            assert entity._desired_real_mode() == HVACMode.OFF
+            assert entity._desired_real_mode() == HVACMode.OFF, (
+                f"OFF state at {inside} (≤22.75): expected OFF, "
+                f"got {entity._desired_real_mode()}"
+            )
 
     def test_cool_above_high_runs_cool(self):
         """COOL committed, above band → do work (v2.0.0 unchanged)."""
@@ -359,6 +373,30 @@ class TestAutoCoolHysteresis:
         entity._unit_command = last_cmd
         return entity
 
+    def test_restart_leads_high_edge_not_at_it(self):
+        """Live-deployment regression 2026-04-26.
+
+        User report: "by the time it reaches 23 is too late, we will be
+        outside band".  v3.0.1 with restart-at-high (≥23) would let the
+        compressor's ramp + air-circulation lag push the room *over*
+        the high edge before COOL flow reaches the sensor.
+
+        Fix: restart at mid + COOL_RESTART_OFFSET (default 22.75 for
+        the [21, 23] home preset).  By the time the room would have
+        otherwise reached 23, COOL is already active and pulling down.
+        """
+        # 22.5 — well below threshold, OFF state, must stay OFF
+        e = self._entity(inside=22.5, last_cmd=HVACMode.OFF)
+        assert e._desired_real_mode() == HVACMode.OFF
+        # 22.75 — exactly at threshold, OFF state, still OFF
+        e._current_temperature = 22.75
+        assert e._desired_real_mode() == HVACMode.OFF
+        # 22.8 — past threshold, OFF state, START COOL (lead the high edge)
+        e._current_temperature = 22.8
+        assert e._desired_real_mode() == HVACMode.COOL, (
+            "must restart BEFORE high edge, not at/after it"
+        )
+
     def test_keeps_cooling_above_midpoint(self):
         """COOL state, current still above mid → keep cooling.
 
@@ -381,47 +419,70 @@ class TestAutoCoolHysteresis:
                 f"got {entity._desired_real_mode()}"
             )
 
-    def test_off_state_does_not_restart_in_band(self):
-        """OFF state, current still ≤ high → stay OFF (no restart).
+    def test_off_state_does_not_restart_below_offset(self):
+        """OFF state, current ≤ mid + offset → stay OFF.
 
-        This is the other half of the hysteresis: once OFF, the wrapper
-        does not restart COOL until current rises above the high edge.
+        The wrapper holds OFF until current rises *above* mid + offset
+        (default 22.75 for the [21, 23] band).  The 0.25 °C between the
+        restart threshold and the high edge is intentional headroom —
+        if the wrapper waited until the high edge to restart, the unit's
+        ramp + air-circulation lag would let the room overshoot the band.
         """
-        for inside in (21.0, 22.0, 22.9, 23.0):
+        for inside in (21.0, 22.0, 22.5, 22.75):
             entity = self._entity(inside=inside, last_cmd=HVACMode.OFF)
             assert entity._desired_real_mode() == HVACMode.OFF, (
-                f"OFF state at {inside} (≤high=23): expected OFF, "
+                f"OFF state at {inside} (≤22.75): expected OFF, "
                 f"got {entity._desired_real_mode()}"
             )
 
-    def test_off_state_restarts_above_high(self):
-        """OFF state, current > high → start COOL."""
-        for inside in (23.01, 23.5, 24.0):
+    def test_off_state_restarts_above_offset_lead_high(self):
+        """OFF state, current > mid + offset → start COOL.
+
+        Restart fires before the room reaches the high edge so the
+        compressor has time to ramp.  By the time current would have
+        hit high, COOL air is already flowing.
+        """
+        for inside in (22.76, 22.9, 23.0, 23.5, 24.0):
             entity = self._entity(inside=inside, last_cmd=HVACMode.OFF)
-            assert entity._desired_real_mode() == HVACMode.COOL
+            assert entity._desired_real_mode() == HVACMode.COOL, (
+                f"OFF state at {inside} (>22.75): expected COOL, "
+                f"got {entity._desired_real_mode()}"
+            )
 
     def test_first_sync_with_no_prior_command_treats_as_off_state(self):
         """`_unit_command is None` (first sync) behaves like OFF state:
-        in band → stay OFF; above high → COOL."""
-        e_in_band = self._entity(inside=22.5, last_cmd=None)
-        assert e_in_band._desired_real_mode() == HVACMode.OFF
-        e_above = self._entity(inside=24.0, last_cmd=None)
-        assert e_above._desired_real_mode() == HVACMode.COOL
+        ≤ mid+offset → stay OFF; > mid+offset → COOL."""
+        e_below = self._entity(inside=22.5, last_cmd=None)
+        assert e_below._desired_real_mode() == HVACMode.OFF
+        e_above_threshold = self._entity(inside=22.8, last_cmd=None)
+        assert e_above_threshold._desired_real_mode() == HVACMode.COOL
 
-    def test_full_pull_cycle_minimum_two_starts_per_full_cycle(self):
-        """End-to-end: simulate temp 24 → 22 → 24 → 22 with the wrapper
-        tracking _unit_command.  Verify exactly one COOL start per
-        full cycle (not two from short-cycling at 23)."""
-        # Cycle 1: 24 → start COOL
-        e = self._entity(inside=24.0, last_cmd=HVACMode.OFF)
+    def test_full_pull_cycle_one_start_per_cycle(self):
+        """End-to-end: simulate temp drift 22 → 22.75 → 22.8 → 22 → 22.8
+        with the wrapper tracking _unit_command.  Verify exactly one
+        COOL start per full cycle (not multiple flickers near the
+        restart threshold)."""
+        # Start at midpoint, OFF state
+        e = self._entity(inside=22.0, last_cmd=HVACMode.OFF)
+        assert e._desired_real_mode() == HVACMode.OFF
+
+        # Drift up through OFF zone — must stay OFF
+        for t in (22.25, 22.5, 22.75):
+            e._current_temperature = t
+            assert e._desired_real_mode() == HVACMode.OFF, (
+                f"OFF state at {t} (≤22.75): expected OFF"
+            )
+
+        # Cross the restart threshold → start COOL
+        e._current_temperature = 22.8
         assert e._desired_real_mode() == HVACMode.COOL
-        e._unit_command = HVACMode.COOL  # simulate sync committed COOL
+        e._unit_command = HVACMode.COOL
 
-        # Drift down through band — must stay COOL until mid
-        for t in (23.5, 23.0, 22.5, 22.1):
+        # Drift down through the band — keep COOL all the way to mid
+        for t in (22.7, 22.5, 22.25, 22.1):
             e._current_temperature = t
             assert e._desired_real_mode() == HVACMode.COOL, (
-                f"COOL state at {t} should stay COOL"
+                f"COOL state at {t} (>mid=22) should stay COOL"
             )
 
         # Hit mid → OFF
@@ -429,15 +490,13 @@ class TestAutoCoolHysteresis:
         assert e._desired_real_mode() == HVACMode.OFF
         e._unit_command = HVACMode.OFF
 
-        # Drift around in band — must stay OFF
-        for t in (21.5, 22.0, 22.5, 23.0):
+        # Drift up again to 22.75 — must stay OFF (not flicker)
+        for t in (22.25, 22.5, 22.75):
             e._current_temperature = t
-            assert e._desired_real_mode() == HVACMode.OFF, (
-                f"OFF state at {t} (in band) should stay OFF"
-            )
+            assert e._desired_real_mode() == HVACMode.OFF
 
-        # Climb above high → COOL again (one start, not many)
-        e._current_temperature = 23.1
+        # Cross threshold again — second cycle starts cleanly
+        e._current_temperature = 22.8
         assert e._desired_real_mode() == HVACMode.COOL
 
 

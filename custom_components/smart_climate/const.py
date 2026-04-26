@@ -42,3 +42,14 @@ MIN_TEMP_DIFF = 0.5
 # operation.
 FLIP_MARGIN = 0.5
 FLIP_DWELL = 1800  # 30 min
+
+# COOL hysteresis around the band midpoint.  In AUTO + COOL committed:
+#   start cooling when current > mid + COOL_RESTART_OFFSET
+#   stop cooling when current ≤ mid
+# Keeps the room well shy of the high edge of the comfort band — for the
+# default home preset (21-23, mid=22) this means COOL kicks in at 22.75
+# and pulls down to 22, leaving the upper 0.25 °C of the band as headroom
+# rather than the active operating zone.  Tightens control vs. starting
+# at the high edge, at the cost of more frequent (but still meaningful)
+# compressor pulls.
+COOL_RESTART_OFFSET = 0.75
