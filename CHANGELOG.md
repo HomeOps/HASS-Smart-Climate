@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.2.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v3.1.0...v3.2.0) (2026-04-26)
+
+
+### Features
+
+* persist AUTO state machine + add command-desync detection ([#67](https://github.com/HomeOps/HASS-Smart-Climate/issues/67)) ([2eb32dc](https://github.com/HomeOps/HASS-Smart-Climate/commit/2eb32dc333a697a1a0aee55a5cae3c85d9ad1379))
+
 ## [3.1.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v3.0.2...v3.1.0) (2026-04-26)
 
 
