@@ -302,124 +302,192 @@ downstream reads it.
   sensor's `last_state` is read immediately so the AUTO algorithm
   doesn't run on a stale value during the swap.
 
-## Future Work — Deliberate OFF refinement (refines v2.0.0 contract)
+## v3.0.0 — Deliberate OFF in AUTO+COOL (asymmetric, narrow scope)
 
-> **Status:** design idea, not implemented. Born from a 2026-04-26
-> diagnostic session that established the v2.0.0 "never command OFF in
-> AUTO" rule actively wastes energy in wide-deadband situations on
-> Midea inverter heat pumps.
+> **Status:** implemented in v3.0.0 (PR #58).  Refines the v2.0.0
+> "never command OFF in AUTO" contract, but only for the case where
+> empirical evidence showed it actively wastes energy.
 
 ### What we observed
 
 With smart_climate in AUTO, `current = 21.5 °C`, `target = 25 °C`
-(home preset, low/high = 21/23 → midpoint 22), COOL committed:
+(home preset, low/high = 21/23 → midpoint 22), **COOL committed**:
 
 - Midea unit kept compressor at minimum frequency continuously.
 - `compressor_flags = 0x80 ACTIVE`, `compressor_freq` non-zero,
   `t2b` (indoor coil outlet) pinned at 16.5–17.5 °C indefinitely.
-- Vents pushed ~19 °C air into rooms that were already 3 °C below
-  target. Reproduced identically with both XYE and the factory
-  wired thermostat — confirming this is **Midea unit behavior**, not
-  XYE/wrapper bug.
+- Vents pushed ~14 °C air into rooms that were already 3 °C below
+  target.  Reproduced identically with both XYE and the factory
+  wired thermostat — **Midea unit behavior**, not wrapper bug.
 
-This is the **inverter minimum-frequency floor**: Midea inverters in
-COOL mode at low load don't idle the compressor; they hold at the
-lowest sustainable frequency. Generic-thermostat assumptions (idle
-when current << setpoint) don't hold.
+This is the **COOL minimum-frequency floor**: Midea inverters in
+COOL mode at low load don't idle the compressor.  Likely cause is
+the unit's internal dehumidification logic — many inverter ACs hold
+a minimum compressor speed in COOL to maintain dehumidification
+capacity even when temperature setpoint is met.
 
-### The vicious cycle this creates
+### Why HEAT does NOT need this fix
 
-Without deliberate OFF, an inverter heat pump in COOL mode at low
-load runs a self-defeating loop:
+Tested 2026-04-26 with HEAT in AUTO + room in band: **the unit
+properly idled its compressor**.
 
-1. Room is already below setpoint, no cooling needed.
-2. Compressor holds at minimum frequency anyway → continues to
-   over-cool the room.
-3. Room drifts further below comfort range; HVAC eventually has to
-   transition to HEAT mode (or user complains, raises target).
-4. Heat pump now runs in heating to recover the heat that was
-   needlessly removed in step 2.
-5. Once warm again, room re-enters the upper part of the band,
-   AUTO commits back to COOL, and step 1 repeats.
+The asymmetry is most likely **refrigerant-cycle direction**, not
+dehumidification.  An early hypothesis blamed COOL min-freq on
+internal humidity logic — the unit has a separate selectable Dry
+mode, COOL-only, which seemed to fit.  But Dry mode is *off* and
+COOL still floors, so dehumidification can't be the active driver.
 
-Two compressor stages — cooling then heating — to net zero benefit.
-That's the energy waste the user observed: paying continuously to
-cool, then paying again to undo that cooling. The deliberate-OFF
-design breaks the loop at step 2 by stopping the compressor when
-the room is already where it should be (or beyond).
+Better theory: in COOL the indoor coil is the cold sink, so when
+the compressor stops, refrigerant migrates to it.  On the next
+restart that liquid refrigerant can return to the compressor as a
+slug → bearing wear or shutdown.  Holding a minimum frequency
+prevents migration.  HEAT reverses the cycle (indoor coil is the
+hot side), so refrigerant migrates outdoors when stopped — benign,
+no slug risk on restart.  Compressor protection logic only needs
+to forbid full idle in COOL.
 
-### Why v2.0.0's "never OFF" wastes energy here
+The Dry-mode-COOL-only pairing is then explained simply by
+thermodynamics: dehumidification requires a cold coil to condense
+moisture, and only COOL gives you that.  It's not evidence about
+*how* COOL is controlled.
 
-| Scenario | Compressor power | Effect |
-|----------|-----------------|--------|
-| v2.0.0 (today): stay sticky, run min-freq | ~150 W continuous | Over-cools below band; pays a future heating bill to recover |
-| Proposed: deliberate OFF in wide deadband | ~30 W idle, restart 1–2× per cycle | ~3.5× less average power, no over-cooling, no recovery debt |
+So v2.0.0's "never command OFF" rule is *correct* for HEAT
+(start-up cost > min-freq idle cost, no protection penalty) and
+*wrong* for COOL on this unit (min-freq pumps unwanted cold air).
+v3 makes the correction asymmetric to match.
 
-The "never OFF" reasoning was correct *as a default* — repeated
-short-cycling does waste energy on an inverter (each start = 3–5×
-steady-state power for ~30 s of inrush). But the rule fails when
-running at minimum produces *unwanted* output. Deliberate, infrequent
-OFFs amortise the start cost across long stretches.
+### Risk assessment
 
-### Three OFF triggers (preserves sticky AUTO)
+Damage risk from cycling COOL on/off is **low**:
 
-The sticky-AUTO commitment from v2.0.0 stays. We're **not** flapping
-the *committed* mode. We insert OFF as a *unit-level* state under
-specific conditions:
+- We use the manufacturer's `set_hvac_mode` service.  The unit's
+  firmware runs its own shutdown sequence (pump-down, valve
+  positioning) and startup sequence (soft-start ramp from low
+  frequency).  We're not yanking power.
+- Modern inverter units have built-in anti-short-cycle protection.
+  If the wrapper commands COOL within ~3-5 min of an OFF, the unit
+  queues the request internally.
+- Inverter compressors are far more cycle-tolerant than single-
+  stage; soft-start makes each cycle cheap in wear terms.
+- The OFF command we send is identical to what happens when a user
+  presses OFF on the wired thermostat — a normal manufacturer-
+  designed transition.
 
-1. **Mode-flip transition.** When AUTO has decided to flip
-   (FLIP_DWELL met, opposite-side dwell timer expired): emit
-   `cool → off → wait OFF_SETTLE → heat` (and mirror). Lets the
-   compressor spin down + reversing valve stabilise + refrigerant
-   pressures equalise before the new mode kicks in. Default
-   `OFF_SETTLE = 60 s`. At most ~1–2 mode flips/day in normal use,
-   so the energy cost of one extra startup is negligible.
+Cumulative wear from extra cycling is real but minor (≈30 s of
+equivalent steady-state runtime per start).  The 2 °C band width
+in the Home preset should comfortably keep cycles under 2/hour in
+practice.
 
-2. **Wide-deadband in COOL.** Current is more than `OFF_DEADBAND`
-   (default `1.5 × FLIP_MARGIN ≈ 0.75 °C`) **below** the low setpoint
-   for at least `OFF_HOLD_DOWN` (default 60 s of sustained excursion):
-   command OFF, hold OFF until current rises back to the low
-   setpoint, then resume COOL. Cycle = `cool → off → cool`.
+Watch in live deployment:
 
-3. **Wide-deadband in HEAT.** Mirror: current more than
-   `OFF_DEADBAND` **above** the high setpoint, sustained, → command
-   OFF; hold OFF until current drops back to the high setpoint;
-   resume HEAT. Cycle = `heat → off → heat`.
+1. **Cycle frequency.** > 6 starts/hour sustained → add
+   `OFF_HOLD_UP` (Future Work #2 below).
+2. **Compressor restart frequency curve.** Healthy restart starts
+   low and ramps over ~30-60 s.  If `compressor_freq` jumps
+   straight to high, soft-start isn't engaging; revisit.
+3. **Protection trip codes** in HA logs after the first weeks.
 
-Inside the deadband (`current ∈ [low, high]` and within FLIP_MARGIN
-of midpoint) the v2.0.0 sticky-min-frequency behavior is unchanged —
-that case is where "stay at minimum" is genuinely the right choice.
+### Implemented behavior (v3.0.0)
 
-### Anti-flapping guards
+Sticky AUTO commitment from v2.0.0 is unchanged.  The only change
+is in the unit command derived from the committed direction:
 
-- `OFF_HOLD_DOWN` (sustained-excursion threshold) prevents brief
-  sensor jitter from triggering OFF. If the inside reading bounces
-  past the deadband for 5 s and back, no OFF.
-- `OFF_HOLD_UP` (minimum OFF duration, default 5 min) prevents
-  re-arming the mode the moment current grazes the band edge.
-  Compressor restarts at most once every few minutes worst case.
-- AUTO stays committed throughout — even if we're in `cool → off`,
-  `_auto_mode` is still COOL. The dwell timer for heat/cool flipping
-  only runs when in non-OFF state, so OFF stretches don't accelerate
-  a flip.
+| `_auto_mode` | `current` vs `[low, high]` | Unit command |
+|--------------|---------------------------|--------------|
+| HEAT         | (any)                     | HEAT (v2.0.0 unchanged) |
+| COOL         | in band                   | **OFF** |
+| COOL         | above high                | COOL (v2.0.0) |
+| COOL         | below low                 | COOL (v2.0.0; FLIP_DWELL flips to HEAT) |
 
-### Constants to add
+`hvac_action` returns `IDLE` (not `OFF`) on the wrapper whenever
+the unit_command is OFF — distinguishes "AUTO resting" from
+"user turned it off entirely".  Implemented via a `_unit_command`
+attribute set by `_async_sync_real_climate` and read by the
+`hvac_action` property.
 
-```python
-# const.py additions
-OFF_SETTLE      = 60     # seconds, mode-flip OFF duration
-OFF_DEADBAND    = 0.75   # °C past band edge before OFF triggers
-OFF_HOLD_DOWN   = 60     # seconds of sustained excursion before OFF
-OFF_HOLD_UP     = 300    # minimum OFF duration before re-arming mode
-```
+No anti-flap guards yet.  We deliberately shipped the simplest
+possible thing first (just a band check, no `OFF_HOLD_DOWN`,
+`OFF_HOLD_UP`, or `OFF_DEADBAND`).  If the live deployment shows
+short-cycling at the band edges, those guards are next — see
+"Future Work" below.
 
 ### Integration with the per-preset inside-sensor work
 
-Both refinements share one substrate: smart_climate's
-`current_temperature` (whatever sensor the active preset points at)
-drives all decisions. The per-preset sensor work changes *which*
-sensor; the deliberate-OFF work changes *what to do* with the value.
-They compose cleanly — implement either order.
+Both share one substrate: smart_climate's `current_temperature`
+(whatever sensor the active preset points at) drives all decisions.
+The per-preset sensor work changes *which* sensor; the deliberate-OFF
+work changes *what to do* with the value.  Compose cleanly.
+
+## Future Work — Deliberate-OFF refinements (not yet implemented)
+
+The v3.0.0 implementation is intentionally minimal.  These refinements
+are scoped but not built:
+
+### 1. Mode-flip transition OFF
+
+When AUTO commits a HEAT↔COOL flip (FLIP_DWELL met), emit
+`old_mode → off → wait OFF_SETTLE → new_mode`.  Lets the compressor
+spin down, the reversing valve stabilise, and refrigerant pressures
+equalise before the new mode kicks in.  At most ~1–2 mode flips/day
+in normal use, so the cost of an extra startup is negligible.
+Default `OFF_SETTLE = 60 s`.
+
+### 2. COOL-side anti-flap guards
+
+If the live data shows the COOL unit short-cycling at the band
+edges (sub-10-minute on/off cycles), add:
+
+- `OFF_HOLD_DOWN` (default 60 s): require a sustained in-band
+  reading before triggering OFF.  Filters sensor jitter.
+- `OFF_HOLD_UP` (default 300 s): minimum OFF duration before
+  re-arming COOL.  Prevents re-starting the compressor the moment
+  current grazes the high edge.
+
+### 3. OFF on wrong-side COOL excursion (CANDIDATE)
+
+v3.0.0 deliberately keeps v2.0.0 behavior in the wrong-side COOL
+case: COOL committed + current < low → send COOL (and let
+`FLIP_DWELL` flip the committed direction to HEAT after 30 min).
+Per user direction at PR time: *"OFF only when tending to cool
+inside the band"*.
+
+The downside surfaces on cool spring/fall nights after a warm day:
+AUTO is still committed COOL from the afternoon, the room drifts
+below low overnight, and the wrapper sends COOL into a cold room
+for up to 30 minutes before the dwell-flip kicks in.  Empirically
+small (the unit modulates and the room is already cold so the
+gradient is small), but visible in logs.
+
+If this turns out to matter in the live deployment, the surgical
+fix is:
+
+```python
+if self._auto_mode == HVACMode.COOL:
+    if low <= inside <= high:
+        return HVACMode.OFF
+    if inside < low:           # NEW: don't fight the room
+        return HVACMode.OFF
+    return HVACMode.COOL
+```
+
+Decision deferred until we have overnight data showing the
+behavior is actually a problem.
+
+### 4. Wide-deadband HEAT (DEFERRED — empirically not needed)
+
+Originally proposed as a mirror of the COOL trigger.  Live testing
+2026-04-26 showed HEAT properly idles, so this is not implemented
+and not on the roadmap unless a different unit shows the symmetric
+defect.
+
+### Constants reserved for future use
+
+```python
+# const.py additions, when refinements are needed
+OFF_SETTLE     = 60     # seconds, mode-flip OFF duration
+OFF_HOLD_DOWN  = 60     # seconds in band before OFF (anti-jitter)
+OFF_HOLD_UP    = 300    # minimum OFF duration before re-arming COOL
+```
 
 ## Future Work — Fan time percentage (Ecobee-style)
 

@@ -165,6 +165,12 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # _auto_mode once it has been set continuously for FLIP_DWELL.
         self._pending_flip_since: datetime.datetime | None = None
 
+        # Last unit command (HEAT/COOL/OFF) the wrapper computed for the
+        # real device.  Used by the hvac_action property to surface IDLE
+        # while in AUTO + deliberate-OFF (inside the comfort band) so the
+        # frontend distinguishes "AUTO resting" from "user turned it off".
+        self._unit_command: HVACMode | None = None
+
     # ------------------------------------------------------------------
     # ClimateEntity properties
     # ------------------------------------------------------------------
@@ -186,7 +192,19 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
     @property
     def hvac_action(self) -> HVACAction | None:
-        """Return the current running HVAC action (mirrored from real device)."""
+        """Return the current running HVAC action.
+
+        In AUTO mode, when the wrapper has commanded the real device OFF
+        (deliberate-OFF inside the comfort band), surface IDLE so the
+        frontend distinguishes "AUTO resting between calls for work" from
+        "user turned the thermostat off entirely".  Otherwise mirror the
+        real device's reported action.
+        """
+        if (
+            self._hvac_mode == HVACMode.AUTO
+            and self._unit_command == HVACMode.OFF
+        ):
+            return HVACAction.IDLE
         return self._hvac_action
 
     @property
@@ -469,22 +487,29 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
         For non-AUTO modes the user's choice is passed through.
 
-        In AUTO mode:
-        1. If no mode has been chosen yet, pick HEAT or COOL once based on
-           the outside sensor (or inside-vs-midpoint when no outside sensor
-           is configured).  Tie-break to COOL.
-        2. Otherwise stick with the previously-committed mode regardless of
-           where the inside temperature sits — the (modulating) real device
-           is expected to settle on the band midpoint.
-        3. Flip to the opposite mode only when the inside temperature has
-           been continuously past the midpoint by FLIP_MARGIN against the
-           committed mode for FLIP_DWELL seconds.  The dwell timer is reset
-           only when the temperature crosses fully back to the correct side
-           of the midpoint, so jitter near the FLIP_MARGIN threshold doesn't
-           keep stalling the flip.
+        In AUTO mode the wrapper maintains a sticky **committed direction**
+        (HEAT or COOL) using v2.0.0's FLIP_DWELL/FLIP_MARGIN logic — same
+        as before.  The **unit command** sent to the real device is then
+        derived asymmetrically by committed direction:
 
-        AUTO never returns OFF — the real device is left running at low
-        modulation rather than being repeatedly start/stop cycled.
+        **Committed HEAT** — return HEAT unconditionally (v2.0.0 contract
+        unchanged).  The Midea unit modulates its compressor down to true
+        idle in HEAT when the room is at setpoint, so continuous HEAT at
+        min modulation costs less than OFF/ON cycling.
+
+        **Committed COOL** — narrow, surgical change vs. v2.0.0.  The
+        *only* deviation from v2.0.0 is in-band:
+        - `current ∈ [low, high]`  →  **OFF** (no work needed)
+        - `current > high`         →  COOL  (v2.0.0)
+        - `current < low`          →  COOL  (v2.0.0; FLIP_DWELL flips
+                                     committed direction to HEAT)
+
+        Why only here: on this Midea unit the COOL mode holds a minimum-
+        frequency floor and keeps pushing 12-14 °C supply air into rooms
+        that are already in band — diagnosed empirically 2026-04-25.  HEAT
+        does not have this defect, and COOL outside the band still has
+        real demand to chase.  The wrong-side COOL case (below low) is
+        rare and the existing 30-min dwell flip handles it.
         """
         if self._hvac_mode == HVACMode.OFF:
             return HVACMode.OFF
@@ -506,12 +531,12 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
                 ref = inside
             self._auto_mode = HVACMode.HEAT if ref < mid else HVACMode.COOL
             self._pending_flip_since = None
-            return self._auto_mode
+            # fall through to the band-aware unit-command logic below
 
-        # Flip evaluation.  Wrong-side / right-side bands have a deadzone
-        # in between (mid ± FLIP_MARGIN) where the timer keeps running but
-        # is not reset, so sensor jitter near the margin doesn't repeatedly
-        # cancel an in-progress flip.
+        # Sticky direction-flip evaluation (unchanged from v2.0.0).  Wrong-
+        # side / right-side bands have a deadzone in between (mid ± FLIP_MARGIN)
+        # where the timer keeps running but is not reset, so sensor jitter
+        # near the margin doesn't repeatedly cancel an in-progress flip.
         if self._auto_mode == HVACMode.COOL:
             wrong_side = inside <= mid - FLIP_MARGIN
             right_side = inside >= mid
@@ -531,7 +556,17 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         elif right_side:
             self._pending_flip_since = None
 
-        return self._auto_mode
+        # Unit command — asymmetric between committed directions.
+        # COOL: in-band → OFF; outside band → COOL (matches v2.0.0
+        # everywhere except the in-band case where the Midea min-frequency
+        # floor wastes energy).
+        # HEAT: always HEAT (v2.0.0 contract unchanged; the unit modulates
+        # to true idle in HEAT when no demand).
+        if self._auto_mode == HVACMode.COOL:
+            if low <= inside <= high:
+                return HVACMode.OFF
+            return HVACMode.COOL
+        return HVACMode.HEAT
 
     # ------------------------------------------------------------------
     # Real-climate synchronisation
@@ -543,6 +578,10 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             return
 
         real_mode = self._desired_real_mode()
+        # Record the wrapper's intent so hvac_action can surface IDLE for
+        # deliberate-OFF (AUTO + OFF inside the comfort band) without
+        # re-running _desired_real_mode (which has timer side-effects).
+        self._unit_command = real_mode
 
         real_state = self.hass.states.get(self._real_climate_id)
         if real_state is None:
@@ -550,10 +589,12 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
         current_mode = real_state.state
 
-        # OFF is only reachable here when the user commanded smart climate
-        # OFF after a sensor callback was already queued — AUTO never
-        # returns OFF.  Forward the OFF; only send the command if the real
-        # device isn't already off.
+        # OFF reaches here in two cases now: (a) the user commanded smart
+        # climate OFF, and (b) AUTO is in deliberate-OFF — the wrapper
+        # provides the idle state Midea inverters can't (their HEAT/COOL
+        # modes hold a min-frequency floor instead of truly idling).
+        # Forward the OFF; only send the command if the real device isn't
+        # already off.
         if real_mode == HVACMode.OFF:
             if current_mode != HVACMode.OFF.value:
                 await self.hass.services.async_call(
