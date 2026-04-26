@@ -443,6 +443,56 @@ coarser sensors, raise `COOL_RESTART_OFFSET` to at least
 `(sensor_resolution + 0.5 °C)` so the lead headroom is wider than
 one sensor step.
 
+### Two-tier flip logic (v3.1.0)
+
+Direction commitment changes on two timelines, by severity:
+
+1. **Fast-flip — band-edge violation** (immediate).  When the
+   committed direction is the *opposite* of demand AND inside is
+   strictly past the band edge (`HEAT committed & inside > high`,
+   or `COOL committed & inside < low`), flip on the very next
+   sensor tick.  No dwell, no jitter filter — there's no legitimate
+   jitter explanation for inside being past the wrong band edge.
+
+2. **Dwell-flip — sustained margin excursion** (30 min).  When
+   inside crosses `mid ± FLIP_MARGIN` against the committed
+   direction but stays inside the band, the existing 30-min
+   `FLIP_DWELL` logic filters jitter and only commits the flip
+   after sustained pressure.
+
+Live regression 2026-04-26: with HEAT committed (from a stale
+state surviving an integration reload that pre-dated the v3.0.2
+initial-pick fix), inside at 23.3 °C took 30 minutes to flip to
+COOL — during which the wrapper actively heated the hot room.
+The fast-flip catches this on the first sensor tick.
+
+### Problem detection (`problems` attribute)
+
+The wrapper exposes a `problems` extra-state-attribute — a list
+of detected issues, empty when healthy.  Use in dashboards /
+templates: e.g.
+
+```yaml
+- alert: |
+    {% if state_attr('climate.smart_climate', 'problems') | length > 0 %}
+    Smart Climate: {{ state_attr('climate.smart_climate', 'problems') | join(', ') }}
+    {% endif %}
+```
+
+Conditions checked:
+
+| Code | Meaning | Threshold |
+|---|---|---|
+| `inside_sensor_unavailable` / `_unknown` / `_missing` | Inside-temp sensor is unreachable | immediate |
+| `sensor_stale:Nmin` | Inside sensor hasn't updated in N minutes | `SENSOR_STALE_MINUTES` (15) |
+| `real_climate_unavailable` / `_missing` | Wrapped climate device is unreachable | immediate |
+| `out_of_band:Nmin` | AUTO can't keep room in band | `OUT_OF_BAND_ALERT_MINUTES` (30) |
+| `short_cycle:N/h` | COOL starts/hour too high | `SHORT_CYCLE_THRESHOLD_PER_H` (6) |
+
+`out_of_band` only fires in AUTO (manual modes are on the user's
+terms).  `short_cycle` count is a rolling 1-hour window of `OFF→COOL`
+transitions tracked in `_async_sync_real_climate`.
+
 `hvac_action` returns `IDLE` (not `OFF`) on the wrapper whenever
 the unit_command is OFF — distinguishes "AUTO resting" from
 "user turned it off entirely".  Implemented via a `_unit_command`

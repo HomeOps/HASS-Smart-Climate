@@ -30,6 +30,9 @@ from custom_components.smart_climate.const import (
     FLIP_DWELL,
     FLIP_MARGIN,
     MIN_TEMP_DIFF,
+    OUT_OF_BAND_ALERT_MINUTES,
+    SENSOR_STALE_MINUTES,
+    SHORT_CYCLE_THRESHOLD_PER_H,
 )
 
 
@@ -291,7 +294,8 @@ class TestDesiredRealMode:
                 f"expected HEAT, got {entity._desired_real_mode()}"
             )
 
-        # Outside the band, both directions do work (v2.0.0 unchanged)
+        # Outside the band on the *right* side (committed direction
+        # matches demand): unit command runs the committed direction.
         cool_committed_above = self._entity(inside=high + 1)
         cool_committed_above._auto_mode = HVACMode.COOL
         assert cool_committed_above._desired_real_mode() == HVACMode.COOL
@@ -300,15 +304,19 @@ class TestDesiredRealMode:
         heat_committed_below._auto_mode = HVACMode.HEAT
         assert heat_committed_below._desired_real_mode() == HVACMode.HEAT
 
-        # Wrong-side excursions pass committed direction through (v2.0.0).
-        # The FLIP_DWELL timer flips _auto_mode after sustained excursion.
+        # Wrong-side band-edge excursions: fast-flip to the correct
+        # direction and run *that* direction's unit command.  Skips the
+        # 30-min FLIP_DWELL the v2.0.0 / v3.0.0 wrong-side passthrough
+        # would have waited on.  See TestFastFlipOnBandViolation.
         cool_committed_below = self._entity(inside=low - 1)
         cool_committed_below._auto_mode = HVACMode.COOL
-        assert cool_committed_below._desired_real_mode() == HVACMode.COOL
+        assert cool_committed_below._desired_real_mode() == HVACMode.HEAT
+        assert cool_committed_below._auto_mode == HVACMode.HEAT
 
         heat_committed_above = self._entity(inside=high + 1)
         heat_committed_above._auto_mode = HVACMode.HEAT
-        assert heat_committed_above._desired_real_mode() == HVACMode.HEAT
+        assert heat_committed_above._desired_real_mode() == HVACMode.COOL
+        assert heat_committed_above._auto_mode == HVACMode.COOL
 
 
 class TestAutoCoolOffInBand:
@@ -383,16 +391,13 @@ class TestAutoCoolOffInBand:
         entity = self._entity(inside=23.5, committed=HVACMode.COOL)
         assert entity._desired_real_mode() == HVACMode.COOL
 
-    def test_cool_below_low_runs_cool_v2_compat(self):
-        """COOL committed, below band → COOL passes through (v2.0.0).
-
-        We deliberately do NOT short-circuit to OFF in the wrong-side
-        case.  The user's instruction was: OFF only when tending to cool
-        inside the band.  Wrong-side COOL is rare and the FLIP_DWELL
-        timer flips committed direction to HEAT after 30 min.
-        """
+    def test_cool_below_low_fast_flips_to_heat(self):
+        """COOL committed + inside < low: fast-flip to HEAT immediately
+        (no 30-min dwell wait).  Replaces the v2.0.0 / v3.0.0 wrong-
+        side COOL passthrough — see TestFastFlipOnBandViolation."""
         entity = self._entity(inside=20.5, committed=HVACMode.COOL)
-        assert entity._desired_real_mode() == HVACMode.COOL
+        assert entity._desired_real_mode() == HVACMode.HEAT
+        assert entity._auto_mode == HVACMode.HEAT
 
 
 class TestAutoCoolHysteresis:
@@ -586,12 +591,13 @@ class TestAutoHeatNeverOff:
         entity = self._entity(inside=20.5)
         assert entity._desired_real_mode() == HVACMode.HEAT
 
-    def test_heat_above_high_stays_heat_v2_compat(self):
-        """HEAT committed + warm room → HEAT (wrong-side; FLIP_DWELL
-        eventually commits direction to COOL).  Pass-through matches
-        v2.0.0; no early OFF short-circuit."""
+    def test_heat_above_high_fast_flips_to_cool(self):
+        """HEAT committed + inside > high: fast-flip to COOL immediately
+        (no 30-min dwell wait).  Replaces the v2.0.0 / v3.0.0 wrong-
+        side HEAT passthrough — see TestFastFlipOnBandViolation."""
         entity = self._entity(inside=23.5)
-        assert entity._desired_real_mode() == HVACMode.HEAT
+        assert entity._desired_real_mode() == HVACMode.COOL
+        assert entity._auto_mode == HVACMode.COOL
 
 
 class TestHvacActionInAutoOff:
@@ -834,6 +840,109 @@ class TestStickyAutoMode:
         advance(FLIP_DWELL - 120)
         entity._desired_real_mode()
         assert entity._auto_mode == HVACMode.HEAT
+
+
+class TestFastFlipOnBandViolation:
+    """Fast-flip catches the case the dwell logic is too slow for:
+    committed direction is the *opposite* of demand AND inside is past
+    the band edge.  No legitimate jitter explanation, so flip
+    immediately on the first such tick — skip FLIP_DWELL entirely.
+
+    Live regression 2026-04-26: with HEAT committed (from a bad initial
+    pick or stale state) and inside at 23.3 (above high=23), the dwell
+    logic took 30 minutes to flip — during which the wrapper actively
+    heated a hot room, pushing it further over the high edge.  The
+    initial-pick fix in PR #62 prevents the bad pick; this fast-flip
+    catches *any* future scenario that lands committed-direction at
+    odds with the band (manual override, sudden outside event, etc.).
+    """
+
+    def _entity(self, inside, committed, low=21.0, high=23.0):
+        hass = _make_hass_mock(inside_temp=inside)
+        config = {
+            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
+            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
+        }
+        entity = _make_entity(hass, config)
+        entity._hvac_mode = HVACMode.AUTO
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = inside
+        entity._preset_ranges[PRESET_HOME] = (low, high)
+        entity._auto_mode = committed
+        entity._pending_flip_since = None
+        now, _ = _fake_clock()
+        entity._now = now
+        return entity
+
+    def test_heat_committed_inside_above_high_flips_immediately(self):
+        """HEAT committed + inside > high → flip to COOL on first tick.
+
+        Reproduces the live 2026-04-26 bug at 23.3 °C (above high=23).
+        Pre-fix: dwell timer waited 30 min before flipping.
+        Post-fix: flip on the first sensor tick, no waiting.
+        """
+        entity = self._entity(inside=23.3, committed=HVACMode.HEAT)
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL, (
+            "Fast-flip must fire on first tick when committed=HEAT and "
+            "inside is above high — no dwell tolerable"
+        )
+        assert entity._pending_flip_since is None
+
+    def test_cool_committed_inside_below_low_flips_immediately(self):
+        """Mirror: COOL committed + inside < low → flip to HEAT immediately."""
+        entity = self._entity(inside=20.5, committed=HVACMode.COOL)
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.HEAT
+        assert entity._pending_flip_since is None
+
+    def test_no_fast_flip_at_exact_band_edge(self):
+        """Inside exactly at high (or low) is not a violation — fast-flip
+        only fires for strictly past-the-edge.  At the edge, the dwell
+        logic still applies as the milder corrective."""
+        e_high = self._entity(inside=23.0, committed=HVACMode.HEAT)
+        e_high._desired_real_mode()
+        assert e_high._auto_mode == HVACMode.HEAT, (
+            "Fast-flip must NOT fire at exactly the high edge; only > high"
+        )
+
+        e_low = self._entity(inside=21.0, committed=HVACMode.COOL)
+        e_low._desired_real_mode()
+        assert e_low._auto_mode == HVACMode.COOL
+
+    def test_no_fast_flip_in_band(self):
+        """In-band excursion past FLIP_MARGIN but not past band edge:
+        let the dwell handle it (the case it was designed for)."""
+        # HEAT committed, inside in [mid+FLIP_MARGIN, high) — this is the
+        # dwell's territory, not fast-flip's.
+        entity = self._entity(inside=22.6, committed=HVACMode.HEAT)
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.HEAT, (
+            "In-band past FLIP_MARGIN but not past high: dwell, not fast-flip"
+        )
+
+    def test_no_fast_flip_when_committed_direction_matches_demand(self):
+        """COOL committed + inside > high: do not flip (this is the
+        right direction; the unit command logic returns COOL)."""
+        entity = self._entity(inside=23.5, committed=HVACMode.COOL)
+        entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
+
+        # HEAT committed + inside < low: do not flip (correct direction).
+        entity2 = self._entity(inside=20.5, committed=HVACMode.HEAT)
+        entity2._desired_real_mode()
+        assert entity2._auto_mode == HVACMode.HEAT
+
+    def test_fast_flip_then_unit_command_runs_correct_direction(self):
+        """End-to-end: HEAT committed + inside=23.3 → fast-flip to COOL
+        → unit command returns COOL (since inside > high under COOL)."""
+        entity = self._entity(inside=23.3, committed=HVACMode.HEAT)
+        result = entity._desired_real_mode()
+        assert entity._auto_mode == HVACMode.COOL
+        assert result == HVACMode.COOL, (
+            "Same tick that flips must produce the correct unit command — "
+            "no half-tick limbo where the wrong direction still drives"
+        )
 
 
 class TestLeavingAutoClearsCommitment:
@@ -1373,6 +1482,166 @@ def test_supported_presets_list():
     assert PRESET_AWAY in SUPPORTED_PRESETS
     assert PRESET_NONE in SUPPORTED_PRESETS
     assert len(SUPPORTED_PRESETS) == 4
+
+
+# ---------------------------------------------------------------------------
+# Unit tests – problem detection (`problems` attribute)
+# ---------------------------------------------------------------------------
+
+class TestProblemDetection:
+    """The `problems` extra_state_attribute lists detected issues —
+    empty when healthy.  Used by dashboards / templates to surface
+    actionable notifications instead of silent failure modes."""
+
+    def _entity(self, *, hvac_mode=HVACMode.AUTO, inside=22.0,
+                low=21.0, high=23.0, real_state=HVACMode.OFF.value,
+                inside_state_value=None, inside_last_updated=None):
+        # inside_state_value overrides the sensor's reported state string;
+        # when None the helper uses str(inside).
+        if inside_state_value is None:
+            inside_state_value = str(inside)
+        hass = MagicMock()
+        hass.config.units.temperature_unit = "°C"
+
+        sensor_state = MagicMock()
+        sensor_state.state = inside_state_value
+        sensor_state.last_updated = (
+            inside_last_updated
+            or datetime.datetime(2026, 4, 26, 22, 0, tzinfo=datetime.timezone.utc)
+        )
+
+        real = MagicMock()
+        real.state = real_state
+        real.attributes = {"hvac_action": None, "temperature": None}
+
+        def _get(eid):
+            if eid == REAL_CLIMATE_ID: return real
+            if eid == INSIDE_SENSOR_ID: return sensor_state
+            return None
+        hass.states.get = _get
+        hass.services.async_call = AsyncMock()
+        hass.async_create_task = MagicMock()
+
+        config = {
+            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
+            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
+        }
+        entity = _make_entity(hass, config)
+        entity._hvac_mode = hvac_mode
+        entity._preset_mode = PRESET_HOME
+        entity._current_temperature = inside
+        entity._preset_ranges[PRESET_HOME] = (low, high)
+        # Pin _now to the sensor's last_updated so "fresh" is the default.
+        fixed_now = sensor_state.last_updated
+        entity._now = lambda: fixed_now
+        return entity, sensor_state, real
+
+    def test_healthy_returns_empty_list(self):
+        entity, _, _ = self._entity()
+        assert entity._detect_problems() == []
+        # And the public attribute echoes the same.
+        assert entity.extra_state_attributes == {"problems": []}
+
+    def test_inside_sensor_unavailable(self):
+        entity, sensor, _ = self._entity(inside_state_value="unavailable")
+        problems = entity._detect_problems()
+        assert any(p.startswith("inside_sensor_") for p in problems), problems
+
+    def test_inside_sensor_stale(self):
+        # Sensor last updated 30 min before "now".
+        now = datetime.datetime(2026, 4, 26, 22, 0,
+                                tzinfo=datetime.timezone.utc)
+        old = now - datetime.timedelta(minutes=SENSOR_STALE_MINUTES + 5)
+        entity, _, _ = self._entity(inside_last_updated=old)
+        entity._now = lambda: now
+        problems = entity._detect_problems()
+        assert any(p.startswith("sensor_stale:") for p in problems), problems
+
+    def test_real_climate_unavailable(self):
+        entity, _, real = self._entity()
+        real.state = "unavailable"
+        problems = entity._detect_problems()
+        assert "real_climate_unavailable" in problems
+
+    def test_out_of_band_under_threshold_not_reported(self):
+        """Brief out-of-band excursion below threshold: no alert yet."""
+        entity, _, _ = self._entity(inside=24.0)  # above high=23
+        # Pretend we crossed out 5 min ago.
+        now = datetime.datetime(2026, 4, 26, 22, 0,
+                                tzinfo=datetime.timezone.utc)
+        entity._now = lambda: now
+        entity._out_of_band_since = now - datetime.timedelta(minutes=5)
+        assert all(not p.startswith("out_of_band") for p in entity._detect_problems())
+
+    def test_out_of_band_sustained_reports(self):
+        """Sustained out-of-band past threshold: alert."""
+        entity, _, _ = self._entity(inside=24.0)
+        now = datetime.datetime(2026, 4, 26, 22, 0,
+                                tzinfo=datetime.timezone.utc)
+        entity._now = lambda: now
+        entity._out_of_band_since = (
+            now - datetime.timedelta(minutes=OUT_OF_BAND_ALERT_MINUTES + 5)
+        )
+        problems = entity._detect_problems()
+        assert any(p.startswith("out_of_band:") for p in problems), problems
+
+    def test_out_of_band_only_in_auto(self):
+        """Manual HEAT/COOL/OFF doesn't fire out-of-band alerts — the
+        user is on their own terms there."""
+        entity, _, _ = self._entity(hvac_mode=HVACMode.HEAT, inside=24.0)
+        # Even with stale out_of_band_since, manual mode shouldn't alert.
+        entity._out_of_band_since = (
+            entity._now() - datetime.timedelta(minutes=60)
+        )
+        # Force the AUTO gate by switching: in manual mode, the wrapper
+        # also wouldn't track _out_of_band_since via _on_inside_sensor_update.
+        # We rely on the gate inside _detect_problems.
+        assert all(not p.startswith("out_of_band") for p in entity._detect_problems())
+
+    def test_short_cycle_under_threshold_not_reported(self):
+        entity, _, _ = self._entity()
+        now = entity._now()
+        # SHORT_CYCLE_THRESHOLD_PER_H starts in the last hour: not over.
+        for i in range(SHORT_CYCLE_THRESHOLD_PER_H):
+            entity._cool_start_times.append(
+                now - datetime.timedelta(minutes=i * 5)
+            )
+        assert all(not p.startswith("short_cycle") for p in entity._detect_problems())
+
+    def test_short_cycle_over_threshold_reports(self):
+        entity, _, _ = self._entity()
+        now = entity._now()
+        # SHORT_CYCLE_THRESHOLD_PER_H + 2 starts in the last hour: over.
+        for i in range(SHORT_CYCLE_THRESHOLD_PER_H + 2):
+            entity._cool_start_times.append(
+                now - datetime.timedelta(minutes=i * 3)
+            )
+        problems = entity._detect_problems()
+        assert any(p.startswith("short_cycle:") for p in problems), problems
+
+    def test_short_cycle_window_is_trailing_hour(self):
+        """Old starts (>1h ago) are excluded from the rolling count."""
+        entity, _, _ = self._entity()
+        now = entity._now()
+        # 5 starts > 1h ago — should not count.
+        for i in range(5):
+            entity._cool_start_times.append(
+                now - datetime.timedelta(hours=2, minutes=i)
+            )
+        # 2 starts in the last hour — well under threshold.
+        for i in range(2):
+            entity._cool_start_times.append(
+                now - datetime.timedelta(minutes=i * 5)
+            )
+        assert all(not p.startswith("short_cycle") for p in entity._detect_problems())
+
+    def test_multiple_problems_compose(self):
+        """Independent issues stack; we don't short-circuit at the first."""
+        entity, _, real = self._entity(inside_state_value="unavailable")
+        real.state = "unavailable"
+        problems = entity._detect_problems()
+        assert any(p.startswith("inside_sensor_") for p in problems)
+        assert "real_climate_unavailable" in problems
 
 
 # ---------------------------------------------------------------------------

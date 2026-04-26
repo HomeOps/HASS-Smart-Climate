@@ -8,6 +8,7 @@ Wraps a physical climate device and adds:
 """
 from __future__ import annotations
 
+import collections
 import datetime
 import logging
 import math
@@ -56,6 +57,9 @@ from .const import (
     MAX_TEMP,
     MIN_TEMP,
     MIN_TEMP_DIFF,
+    OUT_OF_BAND_ALERT_MINUTES,
+    SENSOR_STALE_MINUTES,
+    SHORT_CYCLE_THRESHOLD_PER_H,
     TEMP_STEP,
 )
 
@@ -172,6 +176,13 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # frontend distinguishes "AUTO resting" from "user turned it off".
         self._unit_command: HVACMode | None = None
 
+        # Problem-detection state (surfaced via `problems` attribute).
+        # Updated by sensor / sync callbacks; checked at attribute read.
+        self._out_of_band_since: datetime.datetime | None = None
+        self._cool_start_times: collections.deque[datetime.datetime] = (
+            collections.deque(maxlen=20)
+        )
+
     # ------------------------------------------------------------------
     # ClimateEntity properties
     # ------------------------------------------------------------------
@@ -276,6 +287,16 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
     def target_temperature_step(self) -> float:
         """Return the supported step size for target temperature."""
         return TEMP_STEP
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Surface diagnostic attributes alongside HA's standard ones.
+
+        ``problems`` is a list of detected issues (empty when healthy).
+        Useful for dashboards and templates: e.g. trigger a notification
+        when ``state_attr('climate.smart_climate', 'problems') | length > 0``.
+        """
+        return {"problems": self._detect_problems()}
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -429,6 +450,19 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         old_temp = self._current_temperature
         self._current_temperature = new_temp
 
+        # Track sustained out-of-band excursions for problem detection.
+        # Only meaningful in AUTO mode — manual HEAT/COOL/OFF is on the
+        # user's terms.
+        if self._hvac_mode == HVACMode.AUTO:
+            low, high = self._active_range()
+            if new_temp < low or new_temp > high:
+                if self._out_of_band_since is None:
+                    self._out_of_band_since = self._now()
+            else:
+                self._out_of_band_since = None
+        else:
+            self._out_of_band_since = None
+
         # In AUTO preset mode, re-evaluate the real device's mode
         if (
             self._hvac_mode == HVACMode.AUTO
@@ -482,6 +516,67 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
     def _now(self) -> datetime.datetime:
         """Return the current UTC time.  Indirection point for tests."""
         return datetime.datetime.now(datetime.timezone.utc)
+
+    def _detect_problems(self) -> list[str]:
+        """Return a list of detected issues, empty when healthy.
+
+        Checks (in order):
+        - inside-sensor unavailable / unknown / missing
+        - inside-sensor stale (no update for SENSOR_STALE_MINUTES)
+        - real climate device unavailable
+        - sustained out-of-band temperature in AUTO
+        - COOL short-cycling (more than SHORT_CYCLE_THRESHOLD_PER_H starts/h)
+
+        Each problem is a short string code with optional context, e.g.
+        ``out_of_band:42min``, ``short_cycle:8/h``, ``sensor_stale:18min``.
+        """
+        problems: list[str] = []
+        now = self._now()
+
+        # Inside sensor health.
+        inside_state = self.hass.states.get(self._inside_sensor_id)
+        if inside_state is None:
+            problems.append("inside_sensor_missing")
+        elif inside_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, None, ""):
+            problems.append(f"inside_sensor_{inside_state.state}")
+        else:
+            try:
+                last = inside_state.last_updated
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=datetime.timezone.utc)
+                stale_min = (now - last).total_seconds() / 60.0
+                if stale_min > SENSOR_STALE_MINUTES:
+                    problems.append(f"sensor_stale:{int(stale_min)}min")
+            except (AttributeError, TypeError):
+                pass
+
+        # Real climate device health.
+        real_state = self.hass.states.get(self._real_climate_id)
+        if real_state is None:
+            problems.append("real_climate_missing")
+        elif real_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, None, ""):
+            problems.append("real_climate_unavailable")
+
+        # Sustained out-of-band in AUTO.  AUTO that can't keep the room
+        # in band over half-hour windows means the unit is undersized,
+        # blocked, or fighting an unmet load — the user should know.
+        if (
+            self._hvac_mode == HVACMode.AUTO
+            and self._out_of_band_since is not None
+        ):
+            duration = (now - self._out_of_band_since).total_seconds() / 60.0
+            if duration > OUT_OF_BAND_ALERT_MINUTES:
+                problems.append(f"out_of_band:{int(duration)}min")
+
+        # Short cycling.  Count COOL starts in the trailing hour; if it's
+        # over the threshold the wrapper is flicking the compressor too
+        # hard, likely from sensor jitter near the band edge.
+        one_hour_ago = now - datetime.timedelta(hours=1)
+        recent = sum(1 for t in self._cool_start_times if t > one_hour_ago)
+        if recent > SHORT_CYCLE_THRESHOLD_PER_H:
+            problems.append(f"short_cycle:{recent}/h")
+
+        return problems
 
     def _desired_real_mode(self) -> HVACMode:
         """Determine which mode (HEAT/COOL/OFF) the real device should be in.
@@ -550,10 +645,35 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             self._pending_flip_since = None
             # fall through to the band-aware unit-command logic below
 
+        # Fast-flip on band-edge violation: when the committed direction
+        # is the *opposite* of what's needed AND the room is past the
+        # band edge, flip immediately — skip FLIP_DWELL.
+        #
+        # The dwell timer (30 min sustained excursion past mid ± FLIP_MARGIN)
+        # is sized for sensor jitter / natural drift around the midpoint.
+        # That's the wrong filter for the case where committed=HEAT but
+        # inside is already > high (or committed=COOL and inside < low):
+        # there's no jitter explanation for that, only a wrong pick or
+        # an external swing the dwell would take 30 min to correct.
+        # During those 30 min the wrapper actively heats a hot room (or
+        # cools a cold one), making the excursion worse.  Live bug
+        # 2026-04-26 (PR #62 fixed the *initial* pick that caused it;
+        # this is the belt-and-suspenders catch for any future scenario
+        # that lands committed-direction at odds with the band).
+        if (
+            (self._auto_mode == HVACMode.HEAT and inside > high)
+            or (self._auto_mode == HVACMode.COOL and inside < low)
+        ):
+            self._auto_mode = (
+                HVACMode.COOL if self._auto_mode == HVACMode.HEAT else HVACMode.HEAT
+            )
+            self._pending_flip_since = None
+
         # Sticky direction-flip evaluation (unchanged from v2.0.0).  Wrong-
         # side / right-side bands have a deadzone in between (mid ± FLIP_MARGIN)
         # where the timer keeps running but is not reset, so sensor jitter
         # near the margin doesn't repeatedly cancel an in-progress flip.
+        # This handles the in-band drift case the fast-flip above doesn't.
         if self._auto_mode == HVACMode.COOL:
             wrong_side = inside <= mid - FLIP_MARGIN
             right_side = inside >= mid
@@ -609,6 +729,13 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             return
 
         real_mode = self._desired_real_mode()
+        # Record COOL transitions for short-cycle detection.  A "start"
+        # is OFF → COOL (or None → COOL on first sync).
+        if (
+            real_mode == HVACMode.COOL
+            and self._unit_command != HVACMode.COOL
+        ):
+            self._cool_start_times.append(self._now())
         # Record the wrapper's intent so hvac_action can surface IDLE for
         # deliberate-OFF (AUTO + OFF inside the comfort band) without
         # re-running _desired_real_mode (which has timer side-effects).
