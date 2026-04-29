@@ -104,12 +104,27 @@ All tests are in `tests/` and must be kept in sync with implementation changes.
 
 ### AUTO Mode Logic — sticky-mode for modulating real devices
 
-The wrapper picks HEAT or COOL **once** per AUTO entry and holds it; the
-real device's setpoint is the comfort-band midpoint (rounded directionally
-to a whole integer — up for HEAT, down for COOL — and clamped into the
-band).  The (modulating) real device is left to settle on the midpoint at
-low compressor modulation rather than being repeatedly start/stop cycled.
-Real device is **never** commanded OFF in AUTO.
+The wrapper picks HEAT or COOL **once** per AUTO entry and holds it.  The
+real device's setpoint is **asymmetric** by direction (since v3.3.0):
+
+- **HEAT** sends `setpoint = low` (e.g. 21 for the [21, 23] preset).
+- **COOL** sends `setpoint = high - 1` (e.g. 22 for the [21, 23] preset).
+
+The Midea unit's own ±0.5 °C internal hysteresis around setpoint then
+keeps the room near the band edge that matches the committed direction:
+
+- HEAT setpoint=21 → unit holds room around `[21, 21.5]`.
+- COOL setpoint=22 → unit holds room around `[21.5, 22]`.
+
+This biases each direction toward "minimum effort to keep the room in
+band": HEAT sustains the floor, COOL sustains a level just below mid.
+v2.0.0 / v3.0.x targeted the midpoint (22) for both directions; on this
+unit that produced active heating of comfortable rooms (the v3.1.x
+ghost-HEAT pattern, where HEAT setpoint=22 + current=21.4 caused 64-min
+HEAT pulses to push the room from 21.4 to ~22).  Asymmetric setpoints
+make the unit's own setpoint logic a defense-in-depth: even if the
+wrapper commits HEAT incorrectly, the unit won't actively pump heat
+unless the room is genuinely below the floor.
 
 1. **Initial pick** (when no committed mode yet, e.g. AUTO entered fresh
    or after HA restart):
@@ -140,7 +155,7 @@ Four presets supported (Home Assistant standard):
 - `PRESET_AWAY`: Unoccupied (18–26 °C default)
 - `PRESET_NONE`: Manual mode (no preset enforced)
 
-When preset changes, the entity updates the real device's setpoint to the preset's midpoint.
+When preset changes, the entity updates the real device's setpoint per the asymmetric rule (HEAT → low of new preset, COOL → high-1 of new preset).
 
 ### State Restoration
 
@@ -217,7 +232,7 @@ rm -rf .pytest_cache __pycache__ .coverage
 - Tests are comprehensive — always run them before reporting a task complete
 - Avoid breaking preset or state restoration behavior (very sensitive areas)
 - Temperature calculations must maintain numeric precision (use TEMP_STEP consistently)
-- The real climate device's setpoint in AUTO is the preset midpoint (critical invariant)
+- The real climate device's setpoint in AUTO is asymmetric: `low` for HEAT, `high-1` for COOL (v3.3.0+; was midpoint in v2.0.0–v3.2.x). Critical invariant.
 - Master/slave (since #43): smart climate is the sole writer of the real device's
   hvac_mode and setpoint; real-device state events are only mirrored as
   `hvac_action` for UI and never feed back into preset/setpoint state

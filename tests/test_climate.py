@@ -1234,9 +1234,15 @@ class TestSyncedSetpoints:
     """
 
     @pytest.mark.asyncio
-    async def test_sync_heat_targets_midpoint_rounded_up(self):
-        """HEAT in AUTO: target = ceil(midpoint), within the band."""
-        low, high = 21.0, 24.0  # midpoint 22.5 → ceil = 23
+    async def test_sync_heat_targets_low_edge(self):
+        """HEAT in AUTO: setpoint = low edge of band (NOT midpoint).
+
+        v3.3.0 asymmetric setpoint design.  The unit's own ±0.5 °C
+        hysteresis around setpoint=low keeps the room near low (e.g.
+        21..21.5 for low=21), avoiding active heating of comfortable
+        rooms — the v3.1.x ghost-HEAT pattern.
+        """
+        low, high = 21.0, 24.0  # HEAT setpoint should be low = 21
         hass = _make_hass_mock(
             real_climate_state=HVACMode.HEAT.value,
             real_climate_temp=None,
@@ -1255,14 +1261,20 @@ class TestSyncedSetpoints:
         assert call_args[0][0] == "climate"
         assert call_args[0][1] == "set_temperature"
         sent = call_args[0][2]["temperature"]
-        assert sent == 23
+        assert sent == 21, f"HEAT setpoint should be low (21), got {sent}"
         assert sent == int(sent)
         assert call_args[0][2]["hvac_mode"] == HVACMode.HEAT.value
 
     @pytest.mark.asyncio
-    async def test_sync_cool_targets_midpoint_rounded_down(self):
-        """COOL in AUTO: target = floor(midpoint), within the band."""
-        low, high = 21.0, 24.0  # midpoint 22.5 → floor = 22
+    async def test_sync_cool_targets_high_minus_one(self):
+        """COOL in AUTO: setpoint = high - 1 (NOT midpoint).
+
+        Unit cools toward high-1 with its own ±0.5 hysteresis, keeping
+        the room in the upper half of the band (e.g. 22..23 for
+        high=24).  Less aggressive than mid-targeting; saves energy
+        for wider bands.
+        """
+        low, high = 21.0, 24.0  # COOL setpoint should be high - 1 = 23
         hass = _make_hass_mock(
             real_climate_state=HVACMode.COOL.value,
             real_climate_temp=None,
@@ -1278,12 +1290,12 @@ class TestSyncedSetpoints:
         await entity._async_sync_real_climate()
         call_args = hass.services.async_call.call_args
         sent = call_args[0][2]["temperature"]
-        assert sent == 22
+        assert sent == 23, f"COOL setpoint should be high-1 (23), got {sent}"
         assert sent == int(sent)
 
     @pytest.mark.asyncio
-    async def test_sync_21_23_band_heat_target_is_22(self):
-        """21-23 band: midpoint is 22 (integer), HEAT and COOL both send 22."""
+    async def test_sync_21_23_band_heat_target_is_low(self):
+        """21-23 band: HEAT setpoint = low = 21."""
         low, high = 21.0, 23.0
         hass = _make_hass_mock(
             real_climate_state=HVACMode.HEAT.value,
@@ -1298,10 +1310,12 @@ class TestSyncedSetpoints:
         entity._current_temperature = low - 1
         entity._auto_mode = HVACMode.HEAT
         await entity._async_sync_real_climate()
-        assert hass.services.async_call.call_args[0][2]["temperature"] == 22
+        assert hass.services.async_call.call_args[0][2]["temperature"] == 21
 
     @pytest.mark.asyncio
     async def test_sync_21_23_band_cool_target_is_22(self):
+        """21-23 band: COOL setpoint = high-1 = 22 (coincidentally same
+        as old midpoint-based behavior for this narrow band)."""
         low, high = 21.0, 23.0
         hass = _make_hass_mock(
             real_climate_state=HVACMode.COOL.value,
@@ -1323,10 +1337,10 @@ class TestSyncedSetpoints:
         """When the device's reported setpoint matches what we'd send, no
         service call fires — guards against a per-sensor-update resend
         loop (the integer-rounding fix from #46/#47)."""
-        low, high = 21.0, 23.0  # midpoint 22 (integer)
+        low, high = 21.0, 23.0  # HEAT setpoint = low = 21
         hass = _make_hass_mock(
             real_climate_state=HVACMode.HEAT.value,
-            real_climate_temp=22,  # exactly what we'd send
+            real_climate_temp=21,  # exactly what we'd send (HEAT setpoint = low)
             inside_temp=low - 1,
         )
         entity = _make_entity(hass)

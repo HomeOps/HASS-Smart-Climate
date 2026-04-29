@@ -835,14 +835,36 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
                 )
             return
 
-        # In AUTO mode, the modulating real device is asked to settle on the
-        # comfort-band midpoint; mode selection (HEAT vs COOL) is what
-        # determines whether the room is being warmed or cooled towards it.
+        # In AUTO mode, the setpoint sent to the real device is biased
+        # toward the band edge that matches the committed direction —
+        # NOT the band midpoint.  This leverages the unit's own ±0.5 °C
+        # internal hysteresis to keep the room sitting near the edge,
+        # which saves energy and matches occupant comfort better:
+        #
+        #   HEAT setpoint = low      → unit holds room at [low, low+0.5]
+        #   COOL setpoint = high - 1 → unit holds room at [high-1.5, high-1]
+        #
+        # For default home preset (21-23):
+        #   HEAT setpoint=21 → room ~21..21.5
+        #   COOL setpoint=22 → room ~21.5..22
+        #
+        # The mid-targeting that v2.0.0 used was actively wasteful in
+        # sunny PNW climates: HEAT mode at mid=22 would heat a 21.4 °C
+        # room to 22 even though 21.4 is well within the comfort band.
+        # Diagnosed empirically from 48 h of v3.1.x data showing two
+        # 64-min daily HEAT pulses initiated at inside ~21.45 °C.
         low: float | None = None
         high: float | None = None
         if self._hvac_mode == HVACMode.AUTO:
             low, high = self._active_range()
-            target_temp = (low + high) / 2.0
+            if real_mode == HVACMode.HEAT:
+                target_temp = float(low)
+            elif real_mode == HVACMode.COOL:
+                target_temp = float(high) - 1.0
+            else:
+                # OFF — value is irrelevant (set_hvac_mode=off path); use
+                # mid as a neutral fallback.
+                target_temp = (low + high) / 2.0
         else:
             target_temp = self._target_temperature
 
@@ -852,11 +874,11 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         # send — otherwise it silently rounds (e.g. 22.5 → 22) and every
         # inside-sensor update drives another set_temperature call trying to
         # "correct" the mismatch, producing target flutter.
-        # Round directionally (up for HEAT, down for COOL) and stay inside
-        # the comfort band, falling back to the opposite-direction integer
-        # bound when the band is too narrow for the directional rounding to
-        # land inside it (e.g. mid 21.25 in a 21–21.5 band: ceil=22 is
-        # above high → use floor(high)=21 instead).
+        # Round directionally (up for HEAT, down for COOL).  With band-edge
+        # setpoints the rounding usually lands on the integer band edge
+        # itself, but for non-integer bands we still want to stay inside the
+        # comfort band — fall back to the opposite-direction integer bound
+        # when the directional rounding lands outside it.
         if real_mode == HVACMode.HEAT:
             target_temp = float(math.ceil(target_temp))
             if high is not None and target_temp > high:
