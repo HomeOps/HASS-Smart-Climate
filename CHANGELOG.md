@@ -1,5 +1,16 @@
 # Changelog
 
+## [4.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v3.2.0...v4.0.0) (2026-04-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* the AUTO setpoint sent to the wrapped device no longer equals the band midpoint.  Downstream automations or template sensors that assumed `state_attr(real_climate, "temperature") == midpoint(preset)` need to update.  This invariant was documented in CLAUDE.md and is inverted now.
+
+### Features
+
+* asymmetric setpoints — HEAT to low, COOL to high (intermediate band) ([#69](https://github.com/HomeOps/HASS-Smart-Climate/issues/69)) ([091db20](https://github.com/HomeOps/HASS-Smart-Climate/commit/091db20cb6292d9d2b3883654f750afd3b510789))
+
 ## [3.2.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v3.1.0...v3.2.0) (2026-04-26)
 
 

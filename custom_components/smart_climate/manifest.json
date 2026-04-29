@@ -1,7 +1,7 @@
 {
   "domain": "smart_climate",
   "name": "Smart Climate",
-  "version": "3.2.0",
+  "version": "4.0.0",
   "documentation": "https://github.com/HomeOps/HASS-Smart-Climate",
   "issue_tracker": "https://github.com/HomeOps/HASS-Smart-Climate/issues",
   "iot_class": "local_push",
