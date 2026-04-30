@@ -1,5 +1,12 @@
 # Changelog
 
+## [4.0.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v4.0.0...v4.0.1) (2026-04-30)
+
+
+### Bug Fixes
+
+* COOL setpoint back to high - 1 (v4.0.0 setpoint=high was unsafe) ([#71](https://github.com/HomeOps/HASS-Smart-Climate/issues/71)) ([5cd6554](https://github.com/HomeOps/HASS-Smart-Climate/commit/5cd6554bd2cd050162a0d811638a3a2c6b5df232))
+
 ## [4.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v3.2.0...v4.0.0) (2026-04-29)
 
 
