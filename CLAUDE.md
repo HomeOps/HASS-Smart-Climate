@@ -105,35 +105,48 @@ All tests are in `tests/` and must be kept in sync with implementation changes.
 ### AUTO Mode Logic — sticky-mode for modulating real devices
 
 The wrapper picks HEAT or COOL **once** per AUTO entry and holds it.  The
-real device's setpoint is **asymmetric** by direction (since v3.3.0):
+real device's setpoint is **asymmetric** by direction:
 
 - **HEAT** sends `setpoint = low` (e.g. 21 for the [21, 23] preset).
-- **COOL** sends `setpoint = high` (e.g. 23 for the [21, 23] preset).
+- **COOL** sends `setpoint = high - 1` (e.g. 22 for the [21, 23] preset).
 
-The Midea unit's own ±0.5 °C internal hysteresis around setpoint then
-keeps the room near the band edge that matches the committed direction:
+The Midea unit's actual hysteresis is **asymmetric**: it holds the room
+**at or slightly above setpoint** (~setpoint to setpoint + 0.3-0.5) in
+*both* HEAT and COOL.  Initial design assumed symmetric ±0.5 around
+setpoint; live observation 2026-04-29 corrected this — with COOL
+setpoint=23 the unit held the room at 23.2-23.3, *above* the band high
+edge.  v4.0.0's `setpoint=high` formula was therefore unsafe.
 
-- HEAT setpoint=21 → unit holds room around `[21, 21.5]`.
-- COOL setpoint=23 → unit holds room around `[22.5, 23]`.
+Corrected formulas:
 
-This creates a symmetric **intermediate band** of `[mid - 0.5, mid + 0.5]`
-(e.g. 21.5 to 22.5 for the [21, 23] preset) where neither mode actively
-pumps — the unit handles the deadband itself via its own setpoint logic.
+- HEAT setpoint=low → unit holds room at `[low, low + 0.5]` ≈ `[21, 21.5]`.
+- COOL setpoint=high - 1 → unit holds room at `[high - 1, high - 0.5]` ≈ `[22, 22.5]`.
+
+The asymmetric `+0` for HEAT vs `-1` for COOL is dictated by the unit's
+positive-only overshoot: HEAT `setpoint=low` puts the room at low+ε
+(above floor, OK), but COOL `setpoint=high` would put the room at
+high+ε (above ceiling, NOT OK).  Subtracting 1 °C from COOL leaves
+room for the overshoot to land in band.
+
+This gives an intermediate band around `[mid - 0.5, mid]` (e.g. 21.5 to
+22 for [21, 23]) where neither mode actively pumps — the unit handles
+the deadband via its own setpoint logic.  Narrower than the v4.0.0
+"symmetric intermediate band" target (which assumed symmetric unit
+hysteresis), but actually achievable given the unit's real behavior.
 
 v2.0.0 / v3.0.x targeted the midpoint (22) for both directions; on this
 unit that produced active heating of comfortable rooms (the v3.1.x
 ghost-HEAT pattern, where HEAT setpoint=22 + current=21.4 caused 64-min
-HEAT pulses to push the room from 21.4 to ~22).  Asymmetric band-edge
-setpoints make the unit's own setpoint logic a defense-in-depth: even
-if the wrapper commits HEAT incorrectly, the unit won't actively pump
-heat unless the room is genuinely below the floor.
+HEAT pulses to push the room from 21.4 to ~22).  Band-edge setpoints
+fix this by leveraging the unit's own setpoint logic as defense in
+depth: even if the wrapper commits HEAT incorrectly, the unit won't
+actively pump heat unless the room is genuinely below the floor.
 
 The wrapper's existing in-band COOL hysteresis (restart at `mid + 0.75`,
-stop at `mid`) becomes mostly cosmetic with this design — the unit's own
-idle at `high - 0.5` prevents the room from ever naturally reaching
-`mid`, so the wrapper's OFF-command branch rarely fires.  Left in place
-as a safety net; may be revisited once live data confirms it's
-unreachable in practice.
+stop at `mid`) is still useful as a safety net during transition periods
+where outside cooling is faster than the unit's own dynamics could
+anticipate (see the cold-front transition walkthrough in design
+discussion).
 
 1. **Initial pick** (when no committed mode yet, e.g. AUTO entered fresh
    or after HA restart):
@@ -164,7 +177,7 @@ Four presets supported (Home Assistant standard):
 - `PRESET_AWAY`: Unoccupied (18–26 °C default)
 - `PRESET_NONE`: Manual mode (no preset enforced)
 
-When preset changes, the entity updates the real device's setpoint per the asymmetric rule (HEAT → low of new preset, COOL → high of new preset).
+When preset changes, the entity updates the real device's setpoint per the asymmetric rule (HEAT → low of new preset, COOL → high - 1 of new preset).
 
 ### State Restoration
 
@@ -241,7 +254,7 @@ rm -rf .pytest_cache __pycache__ .coverage
 - Tests are comprehensive — always run them before reporting a task complete
 - Avoid breaking preset or state restoration behavior (very sensitive areas)
 - Temperature calculations must maintain numeric precision (use TEMP_STEP consistently)
-- The real climate device's setpoint in AUTO is asymmetric: `low` for HEAT, `high` for COOL (v3.3.0+; was midpoint in v2.0.0–v3.2.x). Critical invariant. Combined with the unit's own ±0.5 hysteresis, gives a symmetric `[mid - 0.5, mid + 0.5]` intermediate band.
+- The real climate device's setpoint in AUTO is asymmetric: `low` for HEAT, `high - 1` for COOL (corrected from v4.0.0's `high` after live observation showed unit overshoot is positive-only, not symmetric). Critical invariant.
 - Master/slave (since #43): smart climate is the sole writer of the real device's
   hvac_mode and setpoint; real-device state events are only mirrored as
   `hvac_action` for UI and never feed back into preset/setpoint state
