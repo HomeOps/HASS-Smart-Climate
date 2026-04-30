@@ -835,31 +835,41 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
                 )
             return
 
-        # In AUTO mode, the setpoint sent to the real device is the
-        # band edge that matches the committed direction — NOT the
-        # midpoint.  Combined with the Midea unit's own ±0.5 °C internal
-        # hysteresis around setpoint, this creates a symmetric
-        # "intermediate band" of `[mid - 0.5, mid + 0.5]` (e.g. 21.5 to
-        # 22.5 for the [21, 23] preset) where neither mode actively
-        # pumps:
+        # In AUTO mode, the setpoint sent to the real device is biased
+        # toward the band edge that matches the committed direction —
+        # NOT the band midpoint, NOT the band edge itself.  The Midea
+        # unit's actual hysteresis is asymmetric: it holds the room
+        # **at or slightly above setpoint** in BOTH modes (~setpoint to
+        # setpoint + 0.3-0.5).  Live observation 2026-04-29 with COOL
+        # setpoint=23 showed room sitting at 23.2-23.3 — *above* the
+        # band high edge (23).  v4.0.0's `setpoint=high` formula was
+        # therefore wrong: it pushed the room out of the comfort band.
         #
-        #   HEAT setpoint = low  → unit holds room at [low, low + 0.5]
-        #   COOL setpoint = high → unit holds room at [high - 0.5, high]
+        # Corrected formulas (since v4.0.x):
+        #
+        #   HEAT setpoint = low      → unit holds room at [low, low+0.5]
+        #   COOL setpoint = high - 1 → unit holds room at [high-1, high-0.5]
         #
         # For default home preset (21-23):
-        #   HEAT setpoint=21 → room ~21..21.5
-        #   COOL setpoint=23 → room ~22.5..23
-        #   Intermediate (no active pumping): 21.5 to 22.5
+        #   HEAT setpoint=21 → room ~21..21.5  (in band, near low)
+        #   COOL setpoint=22 → room ~22..22.5  (in band, mid)
+        #   Intermediate band (no active pumping): 21.5..22
+        #
+        # Why "-1" for COOL but "+0" for HEAT: the unit's overshoot is
+        # always positive (above setpoint), so HEAT setpoint=low gives
+        # room at low+ε (above floor, OK) while COOL setpoint=high
+        # would give room at high+ε (above ceiling, NOT OK).  Subtract
+        # 1 °C from COOL's setpoint to leave room for the overshoot.
         #
         # The mid-targeting that v2.0.0 used was actively wasteful in
         # sunny PNW climates: HEAT mode at mid=22 would heat a 21.4 °C
         # room to 22 even though 21.4 is well within the comfort band.
         # Diagnosed empirically from 48 h of v3.1.x data showing two
         # 64-min daily HEAT pulses initiated at inside ~21.45 °C.
-        # Asymmetric band-edge setpoints fix this by leveraging the
-        # unit's own setpoint logic as defense in depth: even if the
-        # wrapper commits HEAT incorrectly, the unit refuses to actively
-        # pump heat unless the room is genuinely below the floor.
+        # Band-edge setpoints fix this by leveraging the unit's own
+        # setpoint logic as defense in depth: even if the wrapper
+        # commits HEAT incorrectly, the unit refuses to actively pump
+        # heat unless the room is genuinely below the floor.
         low: float | None = None
         high: float | None = None
         if self._hvac_mode == HVACMode.AUTO:
@@ -867,7 +877,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             if real_mode == HVACMode.HEAT:
                 target_temp = float(low)
             elif real_mode == HVACMode.COOL:
-                target_temp = float(high)
+                target_temp = float(high) - 1.0
             else:
                 # OFF — value is irrelevant (set_hvac_mode=off path); use
                 # mid as a neutral fallback.

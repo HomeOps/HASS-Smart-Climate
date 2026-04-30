@@ -1266,17 +1266,17 @@ class TestSyncedSetpoints:
         assert call_args[0][2]["hvac_mode"] == HVACMode.HEAT.value
 
     @pytest.mark.asyncio
-    async def test_sync_cool_targets_high_edge(self):
-        """COOL in AUTO: setpoint = high (the band's upper edge).
+    async def test_sync_cool_targets_high_minus_one(self):
+        """COOL in AUTO: setpoint = high - 1 (one below the band ceiling).
 
-        Unit cools toward high with its own ±0.5 hysteresis, keeping
-        the room in `[high - 0.5, high]` (e.g. 23.5..24 for high=24).
-        Combined with HEAT setpoint=low, this creates a symmetric
-        intermediate band of `[mid - 0.5, mid + 0.5]` where neither
-        mode actively pumps — the unit handles the deadband itself
-        via setpoint-vs-current.
+        v4.0.x corrected the v4.0.0 `setpoint=high` design after live
+        observation 2026-04-29: the Midea unit holds the room at
+        setpoint + 0.2 to 0.5 in COOL (overshoot is positive, NOT
+        symmetric ±0.5 as initially modeled).  With setpoint=23 the
+        room sat at 23.2-23.3 — above the band ceiling.  Subtracting
+        1 °C gives setpoint=22, room at 22.2-22.5, in band.
         """
-        low, high = 21.0, 24.0  # COOL setpoint should be high = 24
+        low, high = 21.0, 24.0  # COOL setpoint should be high - 1 = 23
         hass = _make_hass_mock(
             real_climate_state=HVACMode.COOL.value,
             real_climate_temp=None,
@@ -1292,7 +1292,7 @@ class TestSyncedSetpoints:
         await entity._async_sync_real_climate()
         call_args = hass.services.async_call.call_args
         sent = call_args[0][2]["temperature"]
-        assert sent == 24, f"COOL setpoint should be high (24), got {sent}"
+        assert sent == 23, f"COOL setpoint should be high-1 (23), got {sent}"
         assert sent == int(sent)
 
     @pytest.mark.asyncio
@@ -1315,12 +1315,13 @@ class TestSyncedSetpoints:
         assert hass.services.async_call.call_args[0][2]["temperature"] == 21
 
     @pytest.mark.asyncio
-    async def test_sync_21_23_band_cool_target_is_high(self):
-        """21-23 band: COOL setpoint = high = 23.
+    async def test_sync_21_23_band_cool_target_is_22(self):
+        """21-23 band: COOL setpoint = high - 1 = 22.
 
-        Unit's own ±0.5 hysteresis around 23 keeps room at 22.5..23.
-        Combined with HEAT setpoint=low (21) holding 21..21.5, gives a
-        symmetric 21.5..22.5 intermediate band where neither mode pumps.
+        Unit holds room at setpoint + overshoot ≈ 22.2-22.5, just below
+        the band ceiling (23).  v4.0.0 used `high` (23) but the unit's
+        positive overshoot pushed room to 23.2-23.3 (out of band).
+        Corrected to `high - 1` so the overshoot lands in band.
         """
         low, high = 21.0, 23.0
         hass = _make_hass_mock(
@@ -1336,7 +1337,7 @@ class TestSyncedSetpoints:
         entity._current_temperature = high + 1
         entity._auto_mode = HVACMode.COOL
         await entity._async_sync_real_climate()
-        assert hass.services.async_call.call_args[0][2]["temperature"] == 23
+        assert hass.services.async_call.call_args[0][2]["temperature"] == 22
 
     @pytest.mark.asyncio
     async def test_sync_no_resend_when_device_holds_target(self):
