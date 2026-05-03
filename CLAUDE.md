@@ -104,6 +104,17 @@ All tests are in `tests/` and must be kept in sync with implementation changes.
 
 ### AUTO Mode Logic — sticky-mode for modulating real devices
 
+**v5.0.0 retraction:** the deliberate-OFF design (v3.0.x) and in-band
+COOL hysteresis (v3.0.1, v4.0.x) were removed.  Empirical 2026-05-02
+data showed manual constant-cool with `setpoint=high-1` used **~50×
+less power** than smart_climate's deliberate-OFF cycling on a warm
+afternoon (1.17 kW avg vs. 23 W avg).  The unit's own ±0.5 °C
+hysteresis around the asymmetric setpoint already prevents the
+original min-frequency-floor symptom that motivated deliberate-OFF;
+adding wrapper cycling on top just adds compressor wear.  Below
+sections describe the historical design — the *current* behavior is
+simply "wrapper commits direction; unit handles its own hysteresis".
+
 The wrapper picks HEAT or COOL **once** per AUTO entry and holds it.  The
 real device's setpoint is **asymmetric** by direction:
 
