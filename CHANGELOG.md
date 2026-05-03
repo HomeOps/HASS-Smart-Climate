@@ -1,5 +1,16 @@
 # Changelog
 
+## [5.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v4.0.1...v5.0.0) (2026-05-03)
+
+
+### ⚠ BREAKING CHANGES
+
+* AUTO can no longer return OFF.  v3.0.0''s "AUTO commands OFF in band" contract is undone.  Downstream automations that watched for hvac_mode=off on the wrapped device during AUTO must update — that mode change no longer happens. hvac_action no longer surfaces IDLE either (mirrors the unit directly now).
+
+### Features
+
+* remove deliberate-OFF design — let unit handle its own hysteresis ([#73](https://github.com/HomeOps/HASS-Smart-Climate/issues/73)) ([f161126](https://github.com/HomeOps/HASS-Smart-Climate/commit/f1611267e0e6b1da58ce151ee0be5ddf7c4f09e1))
+
 ## [4.0.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v4.0.0...v4.0.1) (2026-04-30)
 
 
