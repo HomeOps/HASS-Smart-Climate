@@ -46,7 +46,6 @@ from .const import (
     CONF_SLEEP_MAX,
     CONF_SLEEP_MIN,
     COMMAND_GRACE_SECONDS,
-    COOL_RESTART_OFFSET,
     DEFAULT_AWAY_MAX,
     DEFAULT_AWAY_MIN,
     DEFAULT_HOME_MAX,
@@ -211,19 +210,14 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
     @property
     def hvac_action(self) -> HVACAction | None:
-        """Return the current running HVAC action.
-
-        In AUTO mode, when the wrapper has commanded the real device OFF
-        (deliberate-OFF inside the comfort band), surface IDLE so the
-        frontend distinguishes "AUTO resting between calls for work" from
-        "user turned the thermostat off entirely".  Otherwise mirror the
-        real device's reported action.
+        """Return the current running HVAC action mirrored from the real
+        device.  v3.0.x had a special case here that surfaced IDLE when
+        the wrapper had commanded OFF in AUTO+COOL (deliberate-OFF).
+        Removed in v5.0.0 along with the deliberate-OFF design — the
+        wrapper now just commands HEAT or COOL in AUTO and lets the unit
+        idle internally via its own setpoint logic; the unit's own
+        `hvac_action=idle` is the right signal.
         """
-        if (
-            self._hvac_mode == HVACMode.AUTO
-            and self._unit_command == HVACMode.OFF
-        ):
-            return HVACAction.IDLE
         return self._hvac_action
 
     @property
@@ -651,40 +645,34 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         For non-AUTO modes the user's choice is passed through.
 
         In AUTO mode the wrapper maintains a sticky **committed direction**
-        (HEAT or COOL) using v2.0.0's FLIP_DWELL/FLIP_MARGIN logic — same
-        as before.  The **unit command** sent to the real device is then
-        derived asymmetrically by committed direction:
+        (HEAT or COOL) and just commands that direction.  No in-band
+        hysteresis — the unit's own ±0.5 °C internal hysteresis around the
+        asymmetric setpoint (HEAT=low, COOL=high-1) handles when to
+        actually pump:
 
-        **Committed HEAT** — return HEAT unconditionally (v2.0.0 contract
-        unchanged).  The Midea unit modulates its compressor down to true
-        idle in HEAT when the room is at setpoint, so continuous HEAT at
-        min modulation costs less than OFF/ON cycling.
+        - **HEAT** with setpoint=low: unit holds room at `[low, low+0.5]`.
+          Idles when room ≥ low+0.5; heats when below.
+        - **COOL** with setpoint=high-1: unit holds room at
+          `[high-1, high-0.5]`.  Idles when room ≤ high-1; cools when
+          above.
 
-        **Committed COOL** — narrow, surgical change vs. v2.0.0, with
-        hysteresis above the band midpoint:
-        - currently OFF & `current > mid + COOL_RESTART_OFFSET`  →  COOL  (start)
-        - currently COOL & `current > mid`                       →  COOL  (keep cooling)
-        - currently COOL & `current ≤ mid`                       →  OFF   (stop at mid)
-        - currently OFF & `current ≤ mid + COOL_RESTART_OFFSET`  →  OFF
-        - `current > high`                                       →  COOL  (above-band, always)
-        - `current < low`                                        →  COOL  (v2.0.0 wrong-side;
-                                                                   FLIP_DWELL flips to HEAT)
+        Direction is changed by:
 
-        The hysteresis (start at `mid + COOL_RESTART_OFFSET`, stop at
-        `mid`) prevents short-cycling at the band edge.  With the default
-        home preset (21-23, mid=22, offset=0.75) cooling kicks in at
-        22.75 and pulls down to 22 — leaving the upper 0.25 °C of the
-        comfort band as headroom rather than the active operating zone.
-        Tightens control vs. waiting for the high edge, at the cost of
-        more frequent but still-meaningful compressor pulls.
+        - **Initial pick**: inside-vs-mid on first AUTO entry.
+        - **Fast-flip**: inside past the wrong band edge → flip
+          immediately (no dwell).
+        - **Dwell-flip**: inside past `mid ± FLIP_MARGIN` against the
+          committed direction for `FLIP_DWELL` seconds → flip.
 
-        Why only COOL needs this: on this Midea unit the COOL mode holds
-        a minimum-frequency floor and keeps pushing 12-14 °C supply air
-        into rooms already in band — diagnosed empirically 2026-04-25.
-        HEAT does not have this defect (refrigerant migrates outdoors
-        when stopped, no slug-on-restart risk), and COOL outside the band
-        still has real demand to chase.  The wrong-side COOL case (below
-        low) is rare and the existing 30-min dwell flip handles it.
+        v3.0.x added a wrapper-level deliberate-OFF for the COOL-in-band
+        case to fix a Midea min-frequency-floor symptom.  v4.0.0's
+        asymmetric-setpoint design already prevents that symptom (with
+        setpoint=high-1, the unit only actively cools above its own
+        threshold, ~22.5 for [21, 23]).  Keeping deliberate-OFF on top
+        of the corrected setpoint just added cycling overhead — empirical
+        2026-05-02 comparison showed manual constant-cool used **~50×
+        less power** than smart_climate's deliberate-OFF cycling on a
+        warm afternoon (1.17 kW avg vs 23 W avg).  Removed in v5.0.0.
         """
         if self._hvac_mode == HVACMode.OFF:
             return HVACMode.OFF
@@ -760,31 +748,12 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         elif right_side:
             self._pending_flip_since = None
 
-        # Unit command — asymmetric between committed directions.
-        # HEAT: always HEAT (v2.0.0 contract unchanged; the unit modulates
-        # to true idle in HEAT when no demand).
-        # COOL: hysteresis above midpoint inside the band, v2.0.0 elsewhere.
-        #   above high                              → COOL (above-band; v2.0.0)
-        #   below low                               → COOL (wrong-side; v2.0.0)
-        #   was COOL, current > mid                 → COOL (keep cooling to mid)
-        #   was COOL, current ≤ mid                 → OFF (full pull achieved)
-        #   was OFF, current > mid + RESTART_OFFSET → COOL (start, lead high edge)
-        #   was OFF, current ≤ mid + RESTART_OFFSET → OFF
-        # The restart offset (default 0.75 °C above mid) leads the high
-        # edge so the compressor has time to ramp before current would
-        # otherwise overshoot the band.  Stopping at midpoint gives each
-        # start a meaningful pull, amortising start-up cost.
-        if self._auto_mode == HVACMode.COOL:
-            if inside > high or inside < low:
-                return HVACMode.COOL
-            # Inside the band: hysteresis keyed on the previous command.
-            if self._unit_command == HVACMode.COOL:
-                return HVACMode.COOL if inside > mid else HVACMode.OFF
-            # Was OFF (or first sync) — restart well shy of the high edge.
-            if inside > mid + COOL_RESTART_OFFSET:
-                return HVACMode.COOL
-            return HVACMode.OFF
-        return HVACMode.HEAT
+        # Unit command — just the committed direction.  Wrapper does NOT
+        # add in-band hysteresis on top of the unit; the unit's own
+        # setpoint logic (HEAT setpoint=low, COOL setpoint=high-1) keeps
+        # the room near the band edge that matches the committed
+        # direction without the wrapper's intervention.
+        return self._auto_mode
 
     # ------------------------------------------------------------------
     # Real-climate synchronisation

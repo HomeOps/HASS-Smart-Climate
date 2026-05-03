@@ -20,7 +20,6 @@ from custom_components.smart_climate.const import (
     CONF_REAL_CLIMATE,
     CONF_INSIDE_SENSOR,
     CONF_OUTSIDE_SENSOR,
-    COOL_RESTART_OFFSET,
     DEFAULT_HOME_MIN,
     DEFAULT_HOME_MAX,
     DEFAULT_SLEEP_MIN,
@@ -264,35 +263,24 @@ class TestDesiredRealMode:
         assert entity._desired_real_mode() == HVACMode.COOL
         assert entity._auto_mode == HVACMode.COOL
 
-    def test_auto_cool_returns_off_when_inside_band(self):
-        """v3 contract — narrow surgical change: only AUTO + COOL committed
-        + in-band returns OFF.  Everywhere else AUTO behaves exactly as
-        v2.0.0 (HEAT runs continuously and modulates; COOL outside band
-        does work; wrong-side cases pass committed direction through and
-        let FLIP_DWELL flip the direction).
+    def test_auto_returns_committed_direction(self):
+        """v5.0.0 contract: AUTO returns the committed direction (HEAT or
+        COOL) — no in-band hysteresis, no deliberate-OFF.  The unit's
+        own setpoint logic (HEAT setpoint=low, COOL setpoint=high-1)
+        keeps the room at the band edge that matches the committed
+        direction, idling internally when no demand.
         """
         low, high = DEFAULT_HOME_MIN, DEFAULT_HOME_MAX
-        mid = (low + high) / 2
-        # Below the COOL restart threshold (mid + COOL_RESTART_OFFSET): OFF.
-        # Above it but in band: hysteresis would START cooling — see
-        # TestAutoCoolHysteresis for that side.
-        for inside in [low, low + 0.5, mid]:
-            entity = self._entity(inside=inside)
-            entity._auto_mode = HVACMode.COOL
-            assert entity._desired_real_mode() == HVACMode.OFF, (
-                f"COOL committed, current={inside} below restart "
-                f"threshold {mid + COOL_RESTART_OFFSET}: expected OFF, "
-                f"got {entity._desired_real_mode()}"
-            )
 
-        # Committed HEAT + in band → HEAT (v2.0.0 unchanged; unit modulates)
+        # In band — committed direction passes through directly.
         for inside in [low, low + 0.5, (low + high) / 2, high - 0.5, high]:
-            entity = self._entity(inside=inside)
-            entity._auto_mode = HVACMode.HEAT
-            assert entity._desired_real_mode() == HVACMode.HEAT, (
-                f"HEAT committed, current={inside} in [{low},{high}]: "
-                f"expected HEAT, got {entity._desired_real_mode()}"
-            )
+            for direction in (HVACMode.HEAT, HVACMode.COOL):
+                entity = self._entity(inside=inside)
+                entity._auto_mode = direction
+                assert entity._desired_real_mode() == direction, (
+                    f"{direction} committed, current={inside}: "
+                    f"expected {direction}, got {entity._desired_real_mode()}"
+                )
 
         # Outside the band on the *right* side (committed direction
         # matches demand): unit command runs the committed direction.
@@ -305,9 +293,7 @@ class TestDesiredRealMode:
         assert heat_committed_below._desired_real_mode() == HVACMode.HEAT
 
         # Wrong-side band-edge excursions: fast-flip to the correct
-        # direction and run *that* direction's unit command.  Skips the
-        # 30-min FLIP_DWELL the v2.0.0 / v3.0.0 wrong-side passthrough
-        # would have waited on.  See TestFastFlipOnBandViolation.
+        # direction (see TestFastFlipOnBandViolation).
         cool_committed_below = self._entity(inside=low - 1)
         cool_committed_below._auto_mode = HVACMode.COOL
         assert cool_committed_below._desired_real_mode() == HVACMode.HEAT
@@ -317,244 +303,6 @@ class TestDesiredRealMode:
         heat_committed_above._auto_mode = HVACMode.HEAT
         assert heat_committed_above._desired_real_mode() == HVACMode.COOL
         assert heat_committed_above._auto_mode == HVACMode.COOL
-
-
-class TestAutoCoolOffInBand:
-    """Deliberate-OFF in AUTO is **COOL-only**: the wrapper provides the
-    idle the Midea unit fails to provide in COOL mode.
-
-    Diagnosed empirically 2026-04-25/26: COOL holds a min-frequency floor
-    and pushes 12-14 °C supply air into rooms already in band.  HEAT does
-    *not* have this defect (the unit modulates the compressor down to true
-    idle), so the v2.0.0 "never OFF in AUTO" contract is preserved for
-    HEAT and only narrowed for COOL.
-    """
-
-    def _entity(self, inside, low=21.0, high=23.0, committed=HVACMode.COOL):
-        """Build a SmartClimateEntity in AUTO mode with custom band."""
-        hass = _make_hass_mock(inside_temp=inside)
-        config = {
-            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
-            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
-        }
-        entity = _make_entity(hass, config)
-        entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_HOME
-        entity._current_temperature = inside
-        # Override Home preset's range for this test
-        entity._preset_ranges[PRESET_HOME] = (low, high)
-        entity._auto_mode = committed
-        return entity
-
-    def test_overnight_cool_in_band_traversal_stays_off(self):
-        """Reproduces the 2026-04-25 overnight observation.
-
-        With COOL committed, the room sat in [21, 23] for the entire
-        night (10 h, 1812 whole_home_temperature samples).  v2.0.0 kept
-        the compressor at min-freq floor and pushed cold air into rooms
-        already in band.  v3 (COOL-only): OFF the entire time.
-        """
-        overnight_currents = [
-            21.5, 21.7, 22.0, 22.6, 22.7, 22.5,
-            21.4, 21.5, 21.3, 22.6, 22.5, 21.4, 21.3,
-            22.6, 22.5, 21.4, 22.5, 21.5, 21.7,
-        ]
-        for current in overnight_currents:
-            entity = self._entity(
-                inside=current, low=21.0, high=23.0, committed=HVACMode.COOL,
-            )
-            assert entity._desired_real_mode() == HVACMode.OFF, (
-                f"COOL OVERNIGHT-BUG REGRESSION: current={current} "
-                f"(in [21, 23]) should be OFF, got "
-                f"{entity._desired_real_mode()}.  The Midea COOL min-"
-                f"frequency floor wastes energy in band."
-            )
-
-    def test_cool_in_band_below_restart_threshold_yields_off(self):
-        """COOL committed, current ≤ mid + COOL_RESTART_OFFSET, OFF state.
-
-        Hysteresis-aware: in this regime the wrapper holds OFF until the
-        restart threshold (default 0.75 °C above mid) is exceeded.  The
-        upper sliver between threshold and high is the "start cooling"
-        zone (covered by TestAutoCoolHysteresis) and not OFF here.
-        """
-        # Band [21, 23], mid=22, restart threshold=22.75
-        for inside in (21.0, 21.5, 22.0, 22.5, 22.75):
-            entity = self._entity(inside=inside, committed=HVACMode.COOL)
-            assert entity._desired_real_mode() == HVACMode.OFF, (
-                f"OFF state at {inside} (≤22.75): expected OFF, "
-                f"got {entity._desired_real_mode()}"
-            )
-
-    def test_cool_above_high_runs_cool(self):
-        """COOL committed, above band → do work (v2.0.0 unchanged)."""
-        entity = self._entity(inside=23.5, committed=HVACMode.COOL)
-        assert entity._desired_real_mode() == HVACMode.COOL
-
-    def test_cool_below_low_fast_flips_to_heat(self):
-        """COOL committed + inside < low: fast-flip to HEAT immediately
-        (no 30-min dwell wait).  Replaces the v2.0.0 / v3.0.0 wrong-
-        side COOL passthrough — see TestFastFlipOnBandViolation."""
-        entity = self._entity(inside=20.5, committed=HVACMode.COOL)
-        assert entity._desired_real_mode() == HVACMode.HEAT
-        assert entity._auto_mode == HVACMode.HEAT
-
-
-class TestAutoCoolHysteresis:
-    """In-band hysteresis for AUTO + COOL.
-
-    v3.0.0 used a flat threshold at the band edge — the wrapper short-
-    cycled because crossing into the band by 0.1 °C immediately
-    commanded OFF after only ~2 min of useful cooling.  Deployed
-    2026-04-26 and observed live: a 2-minute COOL pulse at 23.0 °C.
-
-    Fix: keep cooling until current drops to the midpoint, then OFF;
-    don't restart until current rises back above high.  Each
-    compressor start now does ~½-band of useful work before stopping,
-    amortising the start-up cost over a meaningful pull.
-    """
-
-    def _entity(self, inside, low=21.0, high=23.0,
-                last_cmd=None, committed=HVACMode.COOL):
-        hass = _make_hass_mock(inside_temp=inside)
-        config = {
-            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
-            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
-        }
-        entity = _make_entity(hass, config)
-        entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_HOME
-        entity._current_temperature = inside
-        entity._preset_ranges[PRESET_HOME] = (low, high)
-        entity._auto_mode = committed
-        entity._unit_command = last_cmd
-        return entity
-
-    def test_restart_leads_high_edge_not_at_it(self):
-        """Live-deployment regression 2026-04-26.
-
-        User report: "by the time it reaches 23 is too late, we will be
-        outside band".  v3.0.1 with restart-at-high (≥23) would let the
-        compressor's ramp + air-circulation lag push the room *over*
-        the high edge before COOL flow reaches the sensor.
-
-        Fix: restart at mid + COOL_RESTART_OFFSET (default 22.75 for
-        the [21, 23] home preset).  By the time the room would have
-        otherwise reached 23, COOL is already active and pulling down.
-        """
-        # 22.5 — well below threshold, OFF state, must stay OFF
-        e = self._entity(inside=22.5, last_cmd=HVACMode.OFF)
-        assert e._desired_real_mode() == HVACMode.OFF
-        # 22.75 — exactly at threshold, OFF state, still OFF
-        e._current_temperature = 22.75
-        assert e._desired_real_mode() == HVACMode.OFF
-        # 22.8 — past threshold, OFF state, START COOL (lead the high edge)
-        e._current_temperature = 22.8
-        assert e._desired_real_mode() == HVACMode.COOL, (
-            "must restart BEFORE high edge, not at/after it"
-        )
-
-    def test_keeps_cooling_above_midpoint(self):
-        """COOL state, current still above mid → keep cooling.
-
-        Reproduces the live bug: at 23.0 °C with COOL just sent, v3.0.0
-        flipped to OFF immediately.  Hysteresis says keep going to mid.
-        """
-        for inside in (22.99, 22.5, 22.1):
-            entity = self._entity(inside=inside, last_cmd=HVACMode.COOL)
-            assert entity._desired_real_mode() == HVACMode.COOL, (
-                f"COOL state at {inside} (>mid=22): expected COOL, "
-                f"got {entity._desired_real_mode()}"
-            )
-
-    def test_stops_at_midpoint(self):
-        """COOL state, current ≤ mid → OFF (compressor stops)."""
-        for inside in (22.0, 21.9, 21.5, 21.0):
-            entity = self._entity(inside=inside, last_cmd=HVACMode.COOL)
-            assert entity._desired_real_mode() == HVACMode.OFF, (
-                f"COOL state at {inside} (≤mid=22): expected OFF, "
-                f"got {entity._desired_real_mode()}"
-            )
-
-    def test_off_state_does_not_restart_below_offset(self):
-        """OFF state, current ≤ mid + offset → stay OFF.
-
-        The wrapper holds OFF until current rises *above* mid + offset
-        (default 22.75 for the [21, 23] band).  The 0.25 °C between the
-        restart threshold and the high edge is intentional headroom —
-        if the wrapper waited until the high edge to restart, the unit's
-        ramp + air-circulation lag would let the room overshoot the band.
-        """
-        for inside in (21.0, 22.0, 22.5, 22.75):
-            entity = self._entity(inside=inside, last_cmd=HVACMode.OFF)
-            assert entity._desired_real_mode() == HVACMode.OFF, (
-                f"OFF state at {inside} (≤22.75): expected OFF, "
-                f"got {entity._desired_real_mode()}"
-            )
-
-    def test_off_state_restarts_above_offset_lead_high(self):
-        """OFF state, current > mid + offset → start COOL.
-
-        Restart fires before the room reaches the high edge so the
-        compressor has time to ramp.  By the time current would have
-        hit high, COOL air is already flowing.
-        """
-        for inside in (22.76, 22.9, 23.0, 23.5, 24.0):
-            entity = self._entity(inside=inside, last_cmd=HVACMode.OFF)
-            assert entity._desired_real_mode() == HVACMode.COOL, (
-                f"OFF state at {inside} (>22.75): expected COOL, "
-                f"got {entity._desired_real_mode()}"
-            )
-
-    def test_first_sync_with_no_prior_command_treats_as_off_state(self):
-        """`_unit_command is None` (first sync) behaves like OFF state:
-        ≤ mid+offset → stay OFF; > mid+offset → COOL."""
-        e_below = self._entity(inside=22.5, last_cmd=None)
-        assert e_below._desired_real_mode() == HVACMode.OFF
-        e_above_threshold = self._entity(inside=22.8, last_cmd=None)
-        assert e_above_threshold._desired_real_mode() == HVACMode.COOL
-
-    def test_full_pull_cycle_one_start_per_cycle(self):
-        """End-to-end: simulate temp drift 22 → 22.75 → 22.8 → 22 → 22.8
-        with the wrapper tracking _unit_command.  Verify exactly one
-        COOL start per full cycle (not multiple flickers near the
-        restart threshold)."""
-        # Start at midpoint, OFF state
-        e = self._entity(inside=22.0, last_cmd=HVACMode.OFF)
-        assert e._desired_real_mode() == HVACMode.OFF
-
-        # Drift up through OFF zone — must stay OFF
-        for t in (22.25, 22.5, 22.75):
-            e._current_temperature = t
-            assert e._desired_real_mode() == HVACMode.OFF, (
-                f"OFF state at {t} (≤22.75): expected OFF"
-            )
-
-        # Cross the restart threshold → start COOL
-        e._current_temperature = 22.8
-        assert e._desired_real_mode() == HVACMode.COOL
-        e._unit_command = HVACMode.COOL
-
-        # Drift down through the band — keep COOL all the way to mid
-        for t in (22.7, 22.5, 22.25, 22.1):
-            e._current_temperature = t
-            assert e._desired_real_mode() == HVACMode.COOL, (
-                f"COOL state at {t} (>mid=22) should stay COOL"
-            )
-
-        # Hit mid → OFF
-        e._current_temperature = 22.0
-        assert e._desired_real_mode() == HVACMode.OFF
-        e._unit_command = HVACMode.OFF
-
-        # Drift up again to 22.75 — must stay OFF (not flicker)
-        for t in (22.25, 22.5, 22.75):
-            e._current_temperature = t
-            assert e._desired_real_mode() == HVACMode.OFF
-
-        # Cross threshold again — second cycle starts cleanly
-        e._current_temperature = 22.8
-        assert e._desired_real_mode() == HVACMode.COOL
 
 
 class TestAutoHeatNeverOff:
@@ -598,91 +346,6 @@ class TestAutoHeatNeverOff:
         entity = self._entity(inside=23.5)
         assert entity._desired_real_mode() == HVACMode.COOL
         assert entity._auto_mode == HVACMode.COOL
-
-
-class TestHvacActionInAutoOff:
-    """hvac_action surfaces IDLE in deliberate-OFF (AUTO + COOL + in-band).
-
-    The real Midea unit, when commanded OFF, reports hvac_action='off'.
-    The wrapper hides that and shows IDLE instead so the user sees
-    "AUTO is resting between calls for work" rather than the alarming
-    "thermostat is OFF" — which usually signals a manual user override.
-    Outside the deliberate-OFF state (HEAT in AUTO, COOL outside band,
-    user OFF), hvac_action mirrors the real device's reported action.
-    """
-
-    def _entity(self, inside, low=21.0, high=23.0, committed=HVACMode.COOL):
-        hass = _make_hass_mock(inside_temp=inside)
-        config = {
-            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
-            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
-        }
-        entity = _make_entity(hass, config)
-        entity._hvac_mode = HVACMode.AUTO
-        entity._preset_mode = PRESET_HOME
-        entity._current_temperature = inside
-        entity._preset_ranges[PRESET_HOME] = (low, high)
-        entity._auto_mode = committed
-        return entity
-
-    @pytest.mark.asyncio
-    async def test_idle_when_auto_cool_in_band(self):
-        """AUTO + COOL + in-band → wrapper sends OFF → hvac_action == IDLE."""
-        entity = self._entity(inside=22.0, committed=HVACMode.COOL)
-        # Real device will be commanded OFF and report 'off' back to us.
-        entity._hvac_action = HVACAction.OFF
-        await entity._async_sync_real_climate()
-        assert entity._unit_command == HVACMode.OFF
-        assert entity.hvac_action == HVACAction.IDLE
-
-    @pytest.mark.asyncio
-    async def test_no_idle_when_auto_heat_in_band(self):
-        """AUTO + HEAT + in-band → unit runs HEAT (modulating) → mirror.
-
-        IDLE is COOL-only.  HEAT in AUTO never commands the real device
-        OFF, so the unit's mirrored action (HEATING or its own internal
-        idle) is what the user should see.
-        """
-        entity = self._entity(inside=22.0, committed=HVACMode.HEAT)
-        entity._hvac_action = HVACAction.HEATING
-        await entity._async_sync_real_climate()
-        assert entity._unit_command == HVACMode.HEAT
-        assert entity.hvac_action == HVACAction.HEATING
-
-    @pytest.mark.asyncio
-    async def test_mirrors_cooling_when_above_high(self):
-        """AUTO + above-high + COOL committed → unit runs COOL → mirror."""
-        entity = self._entity(inside=23.5, committed=HVACMode.COOL)
-        entity._hvac_action = HVACAction.COOLING  # mirrored from real
-        await entity._async_sync_real_climate()
-        assert entity._unit_command == HVACMode.COOL
-        assert entity.hvac_action == HVACAction.COOLING
-
-    @pytest.mark.asyncio
-    async def test_mirrors_heating_when_below_low(self):
-        """AUTO + below-low + HEAT committed → unit runs HEAT → mirror."""
-        entity = self._entity(inside=20.5, committed=HVACMode.HEAT)
-        entity._hvac_action = HVACAction.HEATING
-        await entity._async_sync_real_climate()
-        assert entity._unit_command == HVACMode.HEAT
-        assert entity.hvac_action == HVACAction.HEATING
-
-    def test_user_off_mode_shows_off_not_idle(self):
-        """User-commanded OFF must read OFF, not IDLE — IDLE is reserved
-        for AUTO's deliberate in-band rest."""
-        entity = self._entity(inside=22.0)
-        entity._hvac_mode = HVACMode.OFF  # user turned it off
-        entity._unit_command = HVACMode.OFF
-        entity._hvac_action = HVACAction.OFF
-        assert entity.hvac_action == HVACAction.OFF
-
-    def test_initial_state_no_unit_command_passes_through(self):
-        """Before the first sync runs, _unit_command is None — fall
-        through to whatever the real device last reported."""
-        entity = self._entity(inside=22.0)
-        entity._unit_command = None
-        entity._hvac_action = HVACAction.COOLING
-        assert entity.hvac_action == HVACAction.COOLING
 
 
 class TestStickyAutoMode:
@@ -1361,12 +1024,14 @@ class TestSyncedSetpoints:
         hass.services.async_call.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_sync_cool_sends_off_in_band(self):
-        """v3 contract — narrow surgical change vs. v2.0.0.
+    async def test_sync_cool_in_band_keeps_cool(self):
+        """v5.0.0 contract: AUTO + COOL committed → wrapper sends COOL
+        regardless of where in band the room sits.  The unit's own
+        setpoint=high-1 logic handles when to actually pump.
 
-        AUTO + COOL committed + in band: the wrapper commands the real
-        device OFF so the Midea unit actually idles instead of holding
-        its COOL minimum-frequency floor.
+        Replaces v3.0.x's deliberate-OFF-in-band design — empirical
+        2026-05-02 data showed wrapper-driven cycling used ~50× more
+        power than just letting the unit handle its own hysteresis.
         """
         mid = (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2
         hass = _make_hass_mock(
@@ -1380,10 +1045,16 @@ class TestSyncedSetpoints:
         entity._current_temperature = mid
         entity._auto_mode = HVACMode.COOL  # already committed to COOL
         await entity._async_sync_real_climate()
-        hass.services.async_call.assert_called_once()
-        call_args = hass.services.async_call.call_args
-        assert call_args[0][1] == "set_hvac_mode"
-        assert call_args[0][2]["hvac_mode"] == HVACMode.OFF.value
+        # Wrapper must NOT send OFF — that was the old deliberate-OFF
+        # behavior we removed in v5.0.0.
+        for call in hass.services.async_call.call_args_list:
+            args = call[0]
+            if args[1] == "set_hvac_mode":
+                assert args[2]["hvac_mode"] != HVACMode.OFF.value, (
+                    "v5.0.0: AUTO+COOL must never send OFF, even in band"
+                )
+            elif args[1] == "set_temperature":
+                assert args[2]["hvac_mode"] != HVACMode.OFF.value
 
     @pytest.mark.asyncio
     async def test_sync_heat_never_sends_off_in_band(self):
@@ -1975,9 +1646,9 @@ class TestStateRestoration:
         last_state = self._make_last_state(
             hvac_mode=HVACMode.AUTO.value,
             auto_mode_committed=HVACMode.COOL.value,
-            last_unit_command=HVACMode.OFF.value,
+            last_unit_command=HVACMode.COOL.value,
         )
         entity, _ = await self._setup_entity(last_state)
         attrs = entity.extra_state_attributes
         assert attrs["auto_mode_committed"] == HVACMode.COOL.value
-        assert attrs["last_unit_command"] == HVACMode.OFF.value
+        assert attrs["last_unit_command"] == HVACMode.COOL.value
