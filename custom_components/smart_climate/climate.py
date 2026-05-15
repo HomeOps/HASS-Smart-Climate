@@ -113,6 +113,9 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
+    # Keep climate control precision at tenths (HA-supported value for climate
+    # entity precision); current_temperature display is overridden to hundredths
+    # in state_attributes for smoother charting.
     _attr_precision = PRECISION_TENTHS
     # Suppress backwards-compat warning for turn_on / turn_off
     _enable_turn_on_off_backwards_compat = False
@@ -298,7 +301,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
     @property
     def state_attributes(self) -> dict[str, Any]:
         """Return state attributes with two-decimal current temperature."""
-        attrs = super().state_attributes
+        attrs = dict(super().state_attributes)
         if self._current_temperature is not None:
             attrs["current_temperature"] = round(self._current_temperature, 2)
         return attrs
