@@ -296,6 +296,14 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         return TEMP_STEP
 
     @property
+    def state_attributes(self) -> dict[str, Any]:
+        """Return state attributes with two-decimal current temperature."""
+        attrs = dict(super().state_attributes)
+        if self._current_temperature is not None:
+            attrs["current_temperature"] = round(self._current_temperature, 2)
+        return attrs
+
+    @property
     def extra_state_attributes(self) -> dict[str, Any]:
         """Surface diagnostic + persisted state alongside HA's standard ones.
 
