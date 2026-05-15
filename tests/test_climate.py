@@ -13,6 +13,7 @@ from homeassistant.components.climate.const import (
     PRESET_NONE,
     PRESET_SLEEP,
 )
+from homeassistant.const import PRECISION_TENTHS
 from homeassistant.core import HomeAssistant
 
 from custom_components.smart_climate.climate import SmartClimateEntity, SUPPORTED_PRESETS
@@ -760,6 +761,10 @@ class TestClimateProperties:
         entity = self._entity()
         entity._current_temperature = 22.5
         assert entity.current_temperature == 22.5
+
+    def test_precision_is_tenths(self):
+        entity = self._entity()
+        assert entity.precision == PRECISION_TENTHS
 
 
 # ---------------------------------------------------------------------------

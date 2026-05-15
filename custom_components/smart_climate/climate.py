@@ -29,7 +29,12 @@ from homeassistant.components.climate.const import (
     PRESET_SLEEP,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_TEMPERATURE, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    PRECISION_TENTHS,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
@@ -108,6 +113,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
+    _attr_precision = PRECISION_TENTHS
     # Suppress backwards-compat warning for turn_on / turn_off
     _enable_turn_on_off_backwards_compat = False
 
