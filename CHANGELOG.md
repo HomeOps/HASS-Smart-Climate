@@ -1,5 +1,12 @@
 # Changelog
 
+## [5.0.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v5.0.0...v5.0.1) (2026-05-15)
+
+
+### Bug Fixes
+
+* publish smart_climate current temperature with hundredths precision ([#76](https://github.com/HomeOps/HASS-Smart-Climate/issues/76)) ([a78b028](https://github.com/HomeOps/HASS-Smart-Climate/commit/a78b02801c934e98953e0c20899061f709356cfb))
+
 ## [5.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v4.0.1...v5.0.0) (2026-05-03)
 
 
