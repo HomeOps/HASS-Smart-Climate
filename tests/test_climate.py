@@ -20,6 +20,7 @@ from custom_components.smart_climate.const import (
     CONF_REAL_CLIMATE,
     CONF_INSIDE_SENSOR,
     CONF_OUTSIDE_SENSOR,
+    PRECISION_HUNDREDTHS,
     DEFAULT_HOME_MIN,
     DEFAULT_HOME_MAX,
     DEFAULT_SLEEP_MIN,
@@ -763,7 +764,7 @@ class TestClimateProperties:
 
     def test_precision_is_hundredths(self):
         entity = self._entity()
-        assert entity.precision == 0.01
+        assert entity.precision == PRECISION_HUNDREDTHS
 
 
 # ---------------------------------------------------------------------------

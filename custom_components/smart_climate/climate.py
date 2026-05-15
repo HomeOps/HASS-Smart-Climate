@@ -65,6 +65,7 @@ from .const import (
     SENSOR_STALE_MINUTES,
     SHORT_CYCLE_THRESHOLD_PER_H,
     TEMP_STEP,
+    PRECISION_HUNDREDTHS,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -112,7 +113,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
-    _attr_precision = 0.01
+    _attr_precision = PRECISION_HUNDREDTHS
     # Suppress backwards-compat warning for turn_on / turn_off
     _enable_turn_on_off_backwards_compat = False
 

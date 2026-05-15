@@ -27,6 +27,7 @@ DEFAULT_AWAY_MAX = 26.0
 MIN_TEMP = 10.0
 MAX_TEMP = 35.0
 TEMP_STEP = 0.5
+PRECISION_HUNDREDTHS = 0.01
 
 # Minimum allowed difference between low and high setpoints
 MIN_TEMP_DIFF = 0.5
