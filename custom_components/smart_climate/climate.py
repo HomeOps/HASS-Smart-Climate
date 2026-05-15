@@ -31,7 +31,6 @@ from homeassistant.components.climate.const import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_TEMPERATURE,
-    PRECISION_TENTHS,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
@@ -113,7 +112,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
-    _attr_precision = PRECISION_TENTHS
+    _attr_precision = 0.01
     # Suppress backwards-compat warning for turn_on / turn_off
     _enable_turn_on_off_backwards_compat = False
 
