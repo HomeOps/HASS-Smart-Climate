@@ -6,13 +6,18 @@ import math
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
 
-from homeassistant.components.climate import HVACMode, HVACAction
+from homeassistant.components.climate import (
+    ATTR_CURRENT_TEMPERATURE,
+    HVACAction,
+    HVACMode,
+)
 from homeassistant.components.climate.const import (
     PRESET_AWAY,
     PRESET_HOME,
     PRESET_NONE,
     PRESET_SLEEP,
 )
+from homeassistant.const import PRECISION_TENTHS
 from homeassistant.core import HomeAssistant
 
 from custom_components.smart_climate.climate import SmartClimateEntity, SUPPORTED_PRESETS
@@ -760,6 +765,15 @@ class TestClimateProperties:
         entity = self._entity()
         entity._current_temperature = 22.5
         assert entity.current_temperature == 22.5
+
+    def test_precision_is_tenths(self):
+        entity = self._entity()
+        assert entity.precision == PRECISION_TENTHS
+
+    def test_state_attributes_current_temperature_rounds_to_hundredths(self):
+        entity = self._entity()
+        entity._current_temperature = 22.344
+        assert entity.state_attributes[ATTR_CURRENT_TEMPERATURE] == pytest.approx(22.34)
 
 
 # ---------------------------------------------------------------------------

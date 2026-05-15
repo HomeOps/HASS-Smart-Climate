@@ -29,7 +29,12 @@ from homeassistant.components.climate.const import (
     PRESET_SLEEP,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_TEMPERATURE, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    PRECISION_TENTHS,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
@@ -67,6 +72,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # Presets offered to the user (HA standard preset constants)
 SUPPORTED_PRESETS = [PRESET_HOME, PRESET_SLEEP, PRESET_AWAY, PRESET_NONE]
+CURRENT_TEMP_DISPLAY_DECIMALS = 2
 
 
 async def async_setup_entry(
@@ -108,6 +114,10 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
     _attr_has_entity_name = True
     _attr_should_poll = False
+    # Keep climate control precision at tenths (HA-supported value for climate
+    # entity precision); current_temperature display is overridden to hundredths
+    # in state_attributes for smoother charting.
+    _attr_precision = PRECISION_TENTHS
     # Suppress backwards-compat warning for turn_on / turn_off
     _enable_turn_on_off_backwards_compat = False
 
@@ -288,6 +298,16 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
     def target_temperature_step(self) -> float:
         """Return the supported step size for target temperature."""
         return TEMP_STEP
+
+    @property
+    def state_attributes(self) -> dict[str, Any]:
+        """Return state attributes with two-decimal current temperature."""
+        attrs = dict(super().state_attributes)
+        if self._current_temperature is not None:
+            attrs["current_temperature"] = round(
+                self._current_temperature, CURRENT_TEMP_DISPLAY_DECIMALS
+            )
+        return attrs
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
