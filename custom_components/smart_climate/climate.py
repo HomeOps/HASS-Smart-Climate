@@ -72,6 +72,7 @@ _LOGGER = logging.getLogger(__name__)
 
 # Presets offered to the user (HA standard preset constants)
 SUPPORTED_PRESETS = [PRESET_HOME, PRESET_SLEEP, PRESET_AWAY, PRESET_NONE]
+CURRENT_TEMP_DISPLAY_DECIMALS = 2
 
 
 async def async_setup_entry(
@@ -303,7 +304,9 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         """Return state attributes with two-decimal current temperature."""
         attrs = dict(super().state_attributes)
         if self._current_temperature is not None:
-            attrs["current_temperature"] = round(self._current_temperature, 2)
+            attrs["current_temperature"] = round(
+                self._current_temperature, CURRENT_TEMP_DISPLAY_DECIMALS
+            )
         return attrs
 
     @property
