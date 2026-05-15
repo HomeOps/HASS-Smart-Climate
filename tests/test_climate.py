@@ -770,7 +770,7 @@ class TestClimateProperties:
         entity = self._entity()
         assert entity.precision == PRECISION_TENTHS
 
-    def test_state_attributes_current_temperature_keeps_hundredths(self):
+    def test_state_attributes_current_temperature_rounds_to_hundredths(self):
         entity = self._entity()
         entity._current_temperature = 22.344
         assert entity.state_attributes[ATTR_CURRENT_TEMPERATURE] == pytest.approx(22.34)

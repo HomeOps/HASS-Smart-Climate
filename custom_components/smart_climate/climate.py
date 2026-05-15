@@ -298,7 +298,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
     @property
     def state_attributes(self) -> dict[str, Any]:
         """Return state attributes with two-decimal current temperature."""
-        attrs = dict(super().state_attributes)
+        attrs = super().state_attributes
         if self._current_temperature is not None:
             attrs["current_temperature"] = round(self._current_temperature, 2)
         return attrs
