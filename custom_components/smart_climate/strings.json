@@ -24,9 +24,13 @@
   "options": {
     "step": {
       "init": {
-        "title": "Preset Temperature Ranges",
-        "description": "Configure the comfort temperature ranges for each preset.",
+        "title": "Smart Climate Options",
+        "description": "Configure the per-preset temperature sensors and comfort temperature ranges.",
         "data": {
+          "inside_sensor": "Inside Temperature Sensor (Home / default)",
+          "inside_sensor_sleep": "Inside Temperature Sensor – Sleep (optional)",
+          "inside_sensor_away": "Inside Temperature Sensor – Away (optional)",
+          "outside_sensor": "Outside Temperature Sensor (optional)",
           "home_min": "Home – Low Setpoint (°C)",
           "home_max": "Home – High Setpoint (°C)",
           "sleep_min": "Sleep – Low Setpoint (°C)",
