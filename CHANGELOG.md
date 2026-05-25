@@ -1,5 +1,16 @@
 # Changelog
 
+## [6.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v5.0.1...v6.0.0) (2026-05-25)
+
+
+### ⚠ BREAKING CHANGES
+
+* CONF_INSIDE_SENSOR's semantics change from "the one inside sensor for every preset" to "Home preset + fallback + manual mode." Existing config entries are valid as-is, but tooling or scripts that assumed the single-sensor model should be updated to consider the new per-preset sensors.
+
+### Features
+
+* smart zones — per-preset inside sensors ([#78](https://github.com/HomeOps/HASS-Smart-Climate/issues/78)) ([b025e45](https://github.com/HomeOps/HASS-Smart-Climate/commit/b025e4501f77e383ad8a83bac2870a045c316e21))
+
 ## [5.0.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v5.0.0...v5.0.1) (2026-05-15)
 
 
