@@ -7,7 +7,9 @@
         "data": {
           "name": "Thermostat Name",
           "real_climate": "Climate Device",
-          "inside_sensor": "Inside Temperature Sensor",
+          "inside_sensor": "Inside Temperature Sensor (Home / default)",
+          "inside_sensor_sleep": "Inside Temperature Sensor – Sleep (optional)",
+          "inside_sensor_away": "Inside Temperature Sensor – Away (optional)",
           "outside_sensor": "Outside Temperature Sensor (optional)"
         }
       }

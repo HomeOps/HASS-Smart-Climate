@@ -4,7 +4,20 @@ DOMAIN = "smart_climate"
 
 # Configuration keys
 CONF_REAL_CLIMATE = "real_climate"
+
+# Inside-temperature sensors.  CONF_INSIDE_SENSOR is the *default / Home preset*
+# sensor and also the fallback used when:
+#   - the active preset has no dedicated sensor configured, or
+#   - the active preset's sensor is unavailable / unknown, or
+#   - no preset is active (PRESET_NONE, i.e. the user is manually driving
+#     mode and setpoint).
+# It stays under the key `inside_sensor` for backwards compatibility with
+# existing config entries — older installs that only set this single sensor
+# keep working unchanged.
 CONF_INSIDE_SENSOR = "inside_sensor"
+CONF_INSIDE_SENSOR_SLEEP = "inside_sensor_sleep"
+CONF_INSIDE_SENSOR_AWAY = "inside_sensor_away"
+
 CONF_OUTSIDE_SENSOR = "outside_sensor"
 
 # Preset temperature range configuration keys

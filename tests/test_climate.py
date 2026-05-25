@@ -24,6 +24,8 @@ from custom_components.smart_climate.climate import SmartClimateEntity, SUPPORTE
 from custom_components.smart_climate.const import (
     CONF_REAL_CLIMATE,
     CONF_INSIDE_SENSOR,
+    CONF_INSIDE_SENSOR_AWAY,
+    CONF_INSIDE_SENSOR_SLEEP,
     CONF_OUTSIDE_SENSOR,
     DEFAULT_HOME_MIN,
     DEFAULT_HOME_MAX,
@@ -1666,3 +1668,300 @@ class TestStateRestoration:
         attrs = entity.extra_state_attributes
         assert attrs["auto_mode_committed"] == HVACMode.COOL.value
         assert attrs["last_unit_command"] == HVACMode.COOL.value
+
+
+# ---------------------------------------------------------------------------
+# Unit tests – per-preset inside sensors
+# ---------------------------------------------------------------------------
+
+SLEEP_SENSOR_ID = "sensor.upstairs_avg_temp"
+AWAY_SENSOR_ID = "sensor.whole_home_temperature"
+
+
+def _make_multi_sensor_hass_mock(
+    inside_temp: float | None = 22.0,
+    sleep_temp: float | str | None = 20.0,
+    away_temp: float | str | None = 22.0,
+    real_climate_state: str = HVACMode.OFF.value,
+    real_climate_action: str | None = None,
+    real_climate_temp: float | None = 22.0,
+) -> MagicMock:
+    """hass mock with three distinct inside-temperature sensors.
+
+    Pass ``"unavailable"`` / ``"unknown"`` as a sleep_temp / away_temp to
+    simulate a downed sensor.  Pass ``None`` to make hass.states.get
+    return ``None`` for that entity (sensor not registered).
+    """
+    hass = MagicMock()
+    hass.config.units.temperature_unit = "°C"
+
+    def _state_for(temp):
+        if temp is None:
+            return None
+        state = MagicMock()
+        if isinstance(temp, str):
+            state.state = temp
+        else:
+            state.state = str(temp)
+        state.last_updated = datetime.datetime.now(datetime.timezone.utc)
+        return state
+
+    def _state_getter(entity_id: str):
+        if entity_id == REAL_CLIMATE_ID:
+            state = MagicMock()
+            state.state = real_climate_state
+            state.attributes = {
+                "hvac_action": real_climate_action,
+                "temperature": real_climate_temp,
+            }
+            return state
+        if entity_id == INSIDE_SENSOR_ID:
+            return _state_for(inside_temp)
+        if entity_id == SLEEP_SENSOR_ID:
+            return _state_for(sleep_temp)
+        if entity_id == AWAY_SENSOR_ID:
+            return _state_for(away_temp)
+        return None
+
+    hass.states.get = _state_getter
+    hass.services.async_call = AsyncMock()
+    hass.async_create_task = MagicMock()
+    return hass
+
+
+class TestPerPresetSensors:
+    """Per-preset inside-sensor routing, fallback, and problem reporting."""
+
+    def _config(self, with_sleep: bool = True, with_away: bool = True) -> dict:
+        cfg = {
+            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
+            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
+        }
+        if with_sleep:
+            cfg[CONF_INSIDE_SENSOR_SLEEP] = SLEEP_SENSOR_ID
+        if with_away:
+            cfg[CONF_INSIDE_SENSOR_AWAY] = AWAY_SENSOR_ID
+        return cfg
+
+    # ------------------------------------------------------------------
+    # Resolution
+    # ------------------------------------------------------------------
+
+    def test_home_preset_uses_default_sensor(self):
+        hass = _make_multi_sensor_hass_mock()
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_HOME
+        assert entity._active_sensor_id() == INSIDE_SENSOR_ID
+
+    def test_sleep_preset_uses_sleep_sensor(self):
+        hass = _make_multi_sensor_hass_mock()
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_SLEEP
+        assert entity._active_sensor_id() == SLEEP_SENSOR_ID
+
+    def test_away_preset_uses_away_sensor(self):
+        hass = _make_multi_sensor_hass_mock()
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_AWAY
+        assert entity._active_sensor_id() == AWAY_SENSOR_ID
+
+    def test_preset_none_falls_back_to_default(self):
+        """Manual mode (PRESET_NONE) reads from CONF_INSIDE_SENSOR."""
+        hass = _make_multi_sensor_hass_mock()
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_NONE
+        assert entity._active_sensor_id() == INSIDE_SENSOR_ID
+
+    def test_sleep_unset_falls_back_to_default(self):
+        """If CONF_INSIDE_SENSOR_SLEEP isn't configured, Sleep uses default."""
+        hass = _make_multi_sensor_hass_mock()
+        entity = _make_entity(hass, self._config(with_sleep=False))
+        entity._preset_mode = PRESET_SLEEP
+        assert entity._active_sensor_id() == INSIDE_SENSOR_ID
+
+    def test_away_unset_falls_back_to_default(self):
+        hass = _make_multi_sensor_hass_mock()
+        entity = _make_entity(hass, self._config(with_away=False))
+        entity._preset_mode = PRESET_AWAY
+        assert entity._active_sensor_id() == INSIDE_SENSOR_ID
+
+    def test_unavailable_per_preset_sensor_falls_back(self):
+        """Configured but unavailable preset sensor → silent fallback."""
+        hass = _make_multi_sensor_hass_mock(sleep_temp="unavailable")
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_SLEEP
+        assert entity._active_sensor_id() == INSIDE_SENSOR_ID
+
+    def test_unknown_per_preset_sensor_falls_back(self):
+        hass = _make_multi_sensor_hass_mock(sleep_temp="unknown")
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_SLEEP
+        assert entity._active_sensor_id() == INSIDE_SENSOR_ID
+
+    def test_missing_per_preset_sensor_falls_back(self):
+        """Configured sensor not registered in HA → silent fallback."""
+        hass = _make_multi_sensor_hass_mock(sleep_temp=None)
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_SLEEP
+        assert entity._active_sensor_id() == INSIDE_SENSOR_ID
+
+    # ------------------------------------------------------------------
+    # Sensor reading
+    # ------------------------------------------------------------------
+
+    def test_sync_from_sensors_reads_active_preset_sensor(self):
+        """_sync_from_sensors uses the active preset's sensor, not the default."""
+        hass = _make_multi_sensor_hass_mock(inside_temp=22.0, sleep_temp=19.5)
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_SLEEP
+        entity._sync_from_sensors()
+        assert entity._current_temperature == pytest.approx(19.5)
+
+    def test_on_inside_sensor_update_reads_active_sensor(self):
+        """Update handler reads from the currently active preset's sensor."""
+        hass = _make_multi_sensor_hass_mock(inside_temp=22.0, away_temp=24.7)
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_AWAY
+        entity._hvac_mode = HVACMode.OFF  # avoid AUTO re-sync side effects
+        entity.async_write_ha_state = MagicMock()
+        entity._on_inside_sensor_update()
+        assert entity._current_temperature == pytest.approx(24.7)
+
+    def test_dispatcher_ignores_inactive_sensor_event(self):
+        """A state-change event from a configured-but-inactive sensor must
+        not drive _current_temperature.  Otherwise switching to PRESET_SLEEP
+        and getting a stray HOME-sensor tick would clobber the Sleep reading.
+        """
+        hass = _make_multi_sensor_hass_mock(inside_temp=22.0, sleep_temp=19.5)
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_SLEEP
+        entity._current_temperature = 19.5
+        entity.async_write_ha_state = MagicMock()
+
+        event = MagicMock()
+        event.data = {"entity_id": INSIDE_SENSOR_ID}  # inactive in Sleep
+        entity._async_entity_state_changed(event)
+
+        # Should not have read from the home sensor (still 19.5, not 22.0).
+        assert entity._current_temperature == pytest.approx(19.5)
+
+    def test_dispatcher_routes_active_sensor_event(self):
+        hass = _make_multi_sensor_hass_mock(inside_temp=22.0, sleep_temp=19.5)
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_SLEEP
+        entity._hvac_mode = HVACMode.OFF
+        entity._current_temperature = 21.0
+        entity.async_write_ha_state = MagicMock()
+
+        event = MagicMock()
+        event.data = {"entity_id": SLEEP_SENSOR_ID}
+        entity._async_entity_state_changed(event)
+
+        assert entity._current_temperature == pytest.approx(19.5)
+
+    # ------------------------------------------------------------------
+    # Preset switch synchronously re-seeds
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_preset_change_reseeds_current_temperature(self):
+        """Switching preset must read the new sensor's value synchronously
+        so the AUTO algorithm doesn't run one tick on a stale reading."""
+        hass = _make_multi_sensor_hass_mock(inside_temp=22.0, sleep_temp=19.5)
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_HOME
+        entity._hvac_mode = HVACMode.OFF
+        entity._current_temperature = 22.0
+        entity.async_write_ha_state = MagicMock()
+
+        await entity.async_set_preset_mode(PRESET_SLEEP)
+
+        assert entity._current_temperature == pytest.approx(19.5)
+
+    @pytest.mark.asyncio
+    async def test_preset_change_to_none_uses_default_sensor(self):
+        hass = _make_multi_sensor_hass_mock(inside_temp=22.0, sleep_temp=19.5)
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_SLEEP
+        entity._hvac_mode = HVACMode.OFF
+        entity._current_temperature = 19.5
+        entity.async_write_ha_state = MagicMock()
+
+        await entity.async_set_preset_mode(PRESET_NONE)
+
+        assert entity._current_temperature == pytest.approx(22.0)
+
+    # ------------------------------------------------------------------
+    # Tracked-entity discovery
+    # ------------------------------------------------------------------
+
+    def test_all_inside_sensor_ids_dedupes(self):
+        """If two presets point at the same sensor, list it once."""
+        cfg = {
+            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
+            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
+            CONF_INSIDE_SENSOR_AWAY: INSIDE_SENSOR_ID,  # same as home
+            CONF_INSIDE_SENSOR_SLEEP: SLEEP_SENSOR_ID,
+        }
+        hass = _make_multi_sensor_hass_mock()
+        entity = _make_entity(hass, cfg)
+        ids = entity._all_inside_sensor_ids()
+        assert ids == [INSIDE_SENSOR_ID, SLEEP_SENSOR_ID]
+
+    def test_all_inside_sensor_ids_home_only(self):
+        hass = _make_multi_sensor_hass_mock()
+        entity = _make_entity(hass, {
+            CONF_REAL_CLIMATE: REAL_CLIMATE_ID,
+            CONF_INSIDE_SENSOR: INSIDE_SENSOR_ID,
+        })
+        assert entity._all_inside_sensor_ids() == [INSIDE_SENSOR_ID]
+
+    # ------------------------------------------------------------------
+    # Problem reporting
+    # ------------------------------------------------------------------
+
+    def test_preset_sensor_unavailable_problem_surfaces(self):
+        """Configured per-preset sensor unavailable → problem code AND fallback."""
+        hass = _make_multi_sensor_hass_mock(
+            inside_temp=22.0,
+            sleep_temp="unavailable",
+        )
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_SLEEP
+        entity._hvac_mode = HVACMode.AUTO
+        problems = entity._detect_problems()
+        assert f"preset_sensor_unavailable:{PRESET_SLEEP}" in problems
+        # Fallback to default sensor means no inside_sensor_* problem fires.
+        assert not any(p.startswith("inside_sensor_") for p in problems)
+
+    def test_no_preset_problem_when_sensor_healthy(self):
+        hass = _make_multi_sensor_hass_mock(inside_temp=22.0, sleep_temp=19.5)
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_SLEEP
+        entity._hvac_mode = HVACMode.AUTO
+        problems = entity._detect_problems()
+        assert not any(p.startswith("preset_sensor_unavailable") for p in problems)
+
+    def test_no_preset_problem_when_preset_sensor_unset(self):
+        """If a preset has no dedicated sensor, the fallback isn't a 'problem'."""
+        hass = _make_multi_sensor_hass_mock()
+        entity = _make_entity(hass, self._config(with_sleep=False))
+        entity._preset_mode = PRESET_SLEEP
+        entity._hvac_mode = HVACMode.AUTO
+        problems = entity._detect_problems()
+        assert not any(p.startswith("preset_sensor_unavailable") for p in problems)
+
+    def test_both_sensors_unavailable_surfaces_inside_problem(self):
+        """When the per-preset sensor AND the fallback are unavailable,
+        the wrapper has nothing — surface inside_sensor_unavailable on
+        top of preset_sensor_unavailable."""
+        hass = _make_multi_sensor_hass_mock(
+            inside_temp="unavailable",
+            sleep_temp="unavailable",
+        )
+        entity = _make_entity(hass, self._config())
+        entity._preset_mode = PRESET_SLEEP
+        entity._hvac_mode = HVACMode.AUTO
+        problems = entity._detect_problems()
+        assert f"preset_sensor_unavailable:{PRESET_SLEEP}" in problems
+        assert "inside_sensor_unavailable" in problems
