@@ -46,6 +46,8 @@ from .const import (
     CONF_HOME_MAX,
     CONF_HOME_MIN,
     CONF_INSIDE_SENSOR,
+    CONF_INSIDE_SENSOR_AWAY,
+    CONF_INSIDE_SENSOR_SLEEP,
     CONF_OUTSIDE_SENSOR,
     CONF_REAL_CLIMATE,
     CONF_SLEEP_MAX,
@@ -135,7 +137,23 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         self._attr_unique_id = entry_id
 
         self._real_climate_id: str = config[CONF_REAL_CLIMATE]
+
+        # Per-preset inside sensors.  The Home / default sensor stays under
+        # CONF_INSIDE_SENSOR (no key migration) and doubles as the fallback
+        # for any preset whose dedicated sensor is unset or unavailable, and
+        # as the sensor used in PRESET_NONE (manual mode).  Sleep / Away
+        # sensors are optional.
         self._inside_sensor_id: str = config[CONF_INSIDE_SENSOR]
+        self._preset_sensor_ids: dict[str, str] = {
+            PRESET_HOME: self._inside_sensor_id,
+        }
+        sleep_sensor = config.get(CONF_INSIDE_SENSOR_SLEEP)
+        if sleep_sensor:
+            self._preset_sensor_ids[PRESET_SLEEP] = sleep_sensor
+        away_sensor = config.get(CONF_INSIDE_SENSOR_AWAY)
+        if away_sensor:
+            self._preset_sensor_ids[PRESET_AWAY] = away_sensor
+
         self._outside_sensor_id: str | None = config.get(CONF_OUTSIDE_SENSOR)
 
         # Preset temperature ranges keyed by HA preset constant
@@ -396,8 +414,13 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         if self._hvac_mode != HVACMode.OFF:
             await self._async_sync_real_climate()
 
-        # Subscribe to state changes on all tracked entities.
-        entities_to_track = [self._real_climate_id, self._inside_sensor_id]
+        # Subscribe to state changes on all tracked entities.  All configured
+        # inside sensors are tracked even when not currently active so that
+        # the moment a preset switch makes one of them active we already have
+        # its latest reading buffered.  The dispatcher below filters updates
+        # by the currently-active sensor.
+        entities_to_track = [self._real_climate_id]
+        entities_to_track.extend(self._all_inside_sensor_ids())
         if self._outside_sensor_id:
             entities_to_track.append(self._outside_sensor_id)
 
@@ -409,13 +432,61 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             )
         )
 
+    def _all_inside_sensor_ids(self) -> list[str]:
+        """Return every configured inside-sensor id (deduplicated, stable order).
+
+        Home / default first (always present), then any per-preset sensors
+        that don't share the same entity id.
+        """
+        ordered: list[str] = [self._inside_sensor_id]
+        for preset in (PRESET_SLEEP, PRESET_AWAY):
+            sid = self._preset_sensor_ids.get(preset)
+            if sid and sid not in ordered:
+                ordered.append(sid)
+        return ordered
+
+    def _active_sensor_id(self) -> str:
+        """Resolve which inside sensor drives ``current_temperature`` *now*.
+
+        Rules:
+          - PRESET_HOME / PRESET_SLEEP / PRESET_AWAY → the preset's dedicated
+            sensor if configured, else fall back to CONF_INSIDE_SENSOR.
+          - PRESET_NONE (manual mode) → CONF_INSIDE_SENSOR.
+          - If the per-preset sensor is configured but currently
+            unavailable / unknown / missing, fall back to CONF_INSIDE_SENSOR
+            so AUTO never stalls on a missing reading.  The fallback is
+            surfaced as a ``preset_sensor_unavailable:<preset>`` entry in
+            the ``problems`` attribute (see _detect_problems).
+        """
+        configured = self._preset_sensor_ids.get(self._preset_mode)
+        if configured is None:
+            return self._inside_sensor_id
+        if configured == self._inside_sensor_id:
+            return configured
+        state = self.hass.states.get(configured)
+        if state is None or state.state in (
+            STATE_UNAVAILABLE,
+            STATE_UNKNOWN,
+            None,
+            "",
+        ):
+            return self._inside_sensor_id
+        return configured
+
     @callback
     def _async_entity_state_changed(self, event: Any) -> None:
-        """Dispatch state-change events to the appropriate handler."""
+        """Dispatch state-change events to the appropriate handler.
+
+        Inside-sensor updates dispatch only when the changed entity is the
+        currently-active sensor for the active preset.  Updates from
+        configured-but-not-active sensors are ignored — they are still
+        observed by HA so that switching preset can read their latest
+        value synchronously.
+        """
         entity_id: str = event.data.get("entity_id", "")
         if entity_id == self._real_climate_id:
             self._on_real_climate_update()
-        elif entity_id == self._inside_sensor_id:
+        elif entity_id == self._active_sensor_id():
             self._on_inside_sensor_update()
         elif entity_id == self._outside_sensor_id:
             self._on_outside_sensor_update()
@@ -438,7 +509,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
 
     def _sync_from_sensors(self) -> None:
         """Pull current temperatures from the sensor entities at startup."""
-        inside_state = self.hass.states.get(self._inside_sensor_id)
+        inside_state = self.hass.states.get(self._active_sensor_id())
         if inside_state and inside_state.state not in (
             STATE_UNAVAILABLE,
             STATE_UNKNOWN,
@@ -494,7 +565,7 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
     @callback
     def _on_inside_sensor_update(self) -> None:
         """Handle inside temperature sensor state changes."""
-        state = self.hass.states.get(self._inside_sensor_id)
+        state = self.hass.states.get(self._active_sensor_id())
         if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
             return
         try:
@@ -590,8 +661,34 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         problems: list[str] = []
         now = self._now()
 
-        # Inside sensor health.
-        inside_state = self.hass.states.get(self._inside_sensor_id)
+        # Per-preset sensor fallback.  If the active preset has a dedicated
+        # sensor configured but it is unavailable, _active_sensor_id() will
+        # silently fall back to CONF_INSIDE_SENSOR.  Surface that here so a
+        # dashboard alert can pick it up — the wrapper keeps running, but a
+        # chronic preset-sensor outage means the preset isn't actually
+        # zoning anything.
+        configured = self._preset_sensor_ids.get(self._preset_mode)
+        if (
+            configured is not None
+            and configured != self._inside_sensor_id
+        ):
+            preset_state = self.hass.states.get(configured)
+            if preset_state is None:
+                problems.append(f"preset_sensor_unavailable:{self._preset_mode}")
+            elif preset_state.state in (
+                STATE_UNAVAILABLE,
+                STATE_UNKNOWN,
+                None,
+                "",
+            ):
+                problems.append(f"preset_sensor_unavailable:{self._preset_mode}")
+
+        # Inside sensor health — checked against the *active* sensor (which
+        # may have already fallen back to CONF_INSIDE_SENSOR above).  If
+        # even the fallback is unavailable, the wrapper has nothing to
+        # work with — that's the real failure mode.
+        active_sensor_id = self._active_sensor_id()
+        inside_state = self.hass.states.get(active_sensor_id)
         if inside_state is None:
             problems.append("inside_sensor_missing")
         elif inside_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN, None, ""):
@@ -959,9 +1056,23 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         self._updating_from_control = False
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
-        """Set the active preset, updating the temperature range accordingly."""
+        """Set the active preset, updating the temperature range accordingly.
+
+        The active inside sensor changes with the preset (each preset can
+        point at its own sensor — common rooms for Home, bedroom average
+        for Sleep, whole-home for Away).  Seed ``_current_temperature``
+        synchronously from the new sensor's last_state so the AUTO
+        decision logic does not run one tick on a stale reading from
+        the previous preset's sensor.
+        """
         self._updating_from_control = True
+        old_preset = self._preset_mode
         self._preset_mode = preset_mode
+
+        # Re-seed current_temperature from the (possibly new) active sensor.
+        # Cheap and idempotent when the sensor didn't actually change.
+        if preset_mode != old_preset:
+            self._sync_from_sensors()
 
         if preset_mode != PRESET_NONE:
             low, high = self._active_range()

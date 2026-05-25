@@ -24,6 +24,8 @@ from .const import (
     CONF_HOME_MAX,
     CONF_HOME_MIN,
     CONF_INSIDE_SENSOR,
+    CONF_INSIDE_SENSOR_AWAY,
+    CONF_INSIDE_SENSOR_SLEEP,
     CONF_OUTSIDE_SENSOR,
     CONF_REAL_CLIMATE,
     CONF_SLEEP_MAX,
@@ -75,6 +77,12 @@ class SmartClimateConfigFlow(ConfigFlow, domain=DOMAIN):
                     EntitySelectorConfig(domain=CLIMATE_DOMAIN)
                 ),
                 vol.Required(CONF_INSIDE_SENSOR): EntitySelector(
+                    EntitySelectorConfig(domain=SENSOR_DOMAIN)
+                ),
+                vol.Optional(CONF_INSIDE_SENSOR_SLEEP): EntitySelector(
+                    EntitySelectorConfig(domain=SENSOR_DOMAIN)
+                ),
+                vol.Optional(CONF_INSIDE_SENSOR_AWAY): EntitySelector(
                     EntitySelectorConfig(domain=SENSOR_DOMAIN)
                 ),
                 vol.Optional(CONF_OUTSIDE_SENSOR): EntitySelector(
