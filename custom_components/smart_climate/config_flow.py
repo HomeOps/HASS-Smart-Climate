@@ -112,39 +112,69 @@ class SmartClimateOptionsFlow(OptionsFlow):
         self._config_entry = config_entry
 
     async def async_step_init(self, user_input=None):
-        """Manage the preset temperature options."""
+        """Manage sensors and preset temperature options for an existing entry.
+
+        Includes the per-preset inside sensors so existing installs can wire
+        up Sleep / Away zones without deleting and re-adding the integration.
+        Pre-populates every field from the union of ``entry.data`` (initial
+        setup values) and ``entry.options`` (previous edits via this flow)
+        so the form always shows the currently effective configuration.
+        """
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current = {**self._config_entry.options}
+        current = {**self._config_entry.data, **self._config_entry.options}
 
-        schema = vol.Schema(
-            {
-                vol.Required(
-                    CONF_HOME_MIN,
-                    default=current.get(CONF_HOME_MIN, DEFAULT_HOME_MIN),
-                ): _TEMP_SELECTOR,
-                vol.Required(
-                    CONF_HOME_MAX,
-                    default=current.get(CONF_HOME_MAX, DEFAULT_HOME_MAX),
-                ): _TEMP_SELECTOR,
-                vol.Required(
-                    CONF_SLEEP_MIN,
-                    default=current.get(CONF_SLEEP_MIN, DEFAULT_SLEEP_MIN),
-                ): _TEMP_SELECTOR,
-                vol.Required(
-                    CONF_SLEEP_MAX,
-                    default=current.get(CONF_SLEEP_MAX, DEFAULT_SLEEP_MAX),
-                ): _TEMP_SELECTOR,
-                vol.Required(
-                    CONF_AWAY_MIN,
-                    default=current.get(CONF_AWAY_MIN, DEFAULT_AWAY_MIN),
-                ): _TEMP_SELECTOR,
-                vol.Required(
-                    CONF_AWAY_MAX,
-                    default=current.get(CONF_AWAY_MAX, DEFAULT_AWAY_MAX),
-                ): _TEMP_SELECTOR,
+        # Build optional EntitySelector entries with suggested_value rather
+        # than `default=...` so clearing a field in the form removes the
+        # key from user_input (default= would re-fill the previous value
+        # and make optional sensors un-clearable).
+        def _optional_sensor(key: str) -> dict:
+            value = current.get(key)
+            description = {"suggested_value": value} if value else {}
+            return {
+                vol.Optional(key, description=description): EntitySelector(
+                    EntitySelectorConfig(domain=SENSOR_DOMAIN)
+                )
             }
-        )
+
+        sensor_schema: dict = {
+            vol.Required(
+                CONF_INSIDE_SENSOR,
+                default=current.get(CONF_INSIDE_SENSOR),
+            ): EntitySelector(EntitySelectorConfig(domain=SENSOR_DOMAIN)),
+        }
+        sensor_schema.update(_optional_sensor(CONF_INSIDE_SENSOR_SLEEP))
+        sensor_schema.update(_optional_sensor(CONF_INSIDE_SENSOR_AWAY))
+        sensor_schema.update(_optional_sensor(CONF_OUTSIDE_SENSOR))
+
+        preset_schema = {
+            vol.Required(
+                CONF_HOME_MIN,
+                default=current.get(CONF_HOME_MIN, DEFAULT_HOME_MIN),
+            ): _TEMP_SELECTOR,
+            vol.Required(
+                CONF_HOME_MAX,
+                default=current.get(CONF_HOME_MAX, DEFAULT_HOME_MAX),
+            ): _TEMP_SELECTOR,
+            vol.Required(
+                CONF_SLEEP_MIN,
+                default=current.get(CONF_SLEEP_MIN, DEFAULT_SLEEP_MIN),
+            ): _TEMP_SELECTOR,
+            vol.Required(
+                CONF_SLEEP_MAX,
+                default=current.get(CONF_SLEEP_MAX, DEFAULT_SLEEP_MAX),
+            ): _TEMP_SELECTOR,
+            vol.Required(
+                CONF_AWAY_MIN,
+                default=current.get(CONF_AWAY_MIN, DEFAULT_AWAY_MIN),
+            ): _TEMP_SELECTOR,
+            vol.Required(
+                CONF_AWAY_MAX,
+                default=current.get(CONF_AWAY_MAX, DEFAULT_AWAY_MAX),
+            ): _TEMP_SELECTOR,
+        }
+
+        schema = vol.Schema({**sensor_schema, **preset_schema})
 
         return self.async_show_form(step_id="init", data_schema=schema)
