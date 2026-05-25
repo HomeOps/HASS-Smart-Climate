@@ -1,5 +1,12 @@
 # Changelog
 
+## [6.0.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v6.0.0...v6.0.1) (2026-05-25)
+
+
+### Bug Fixes
+
+* **config_flow:** expose per-preset sensors in options flow ([#80](https://github.com/HomeOps/HASS-Smart-Climate/issues/80)) ([1b221c9](https://github.com/HomeOps/HASS-Smart-Climate/commit/1b221c99607a67a8ac03799bd01d9cb533f2765e))
+
 ## [6.0.0](https://github.com/HomeOps/HASS-Smart-Climate/compare/v5.0.1...v6.0.0) (2026-05-25)
 
 
