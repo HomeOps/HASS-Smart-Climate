@@ -199,6 +199,46 @@ The entity extends `RestoreEntity` to restore:
 
 This survives Home Assistant restarts without requiring persistent state files.
 
+#### Restored attributes are present-but-`None` outside AUTO
+
+`supported_features` advertises `TARGET_TEMPERATURE_RANGE`
+unconditionally, so HA core writes **both** range keys into every
+published state:
+
+```python
+# homeassistant/components/climate/__init__.py
+if ClimateEntityFeature.TARGET_TEMPERATURE_RANGE in supported_features:
+    data[ATTR_TARGET_TEMP_HIGH] = show_temp(hass, self.target_temperature_high, ...)
+    data[ATTR_TARGET_TEMP_LOW]  = show_temp(hass, self.target_temperature_low, ...)
+```
+
+But `target_temperature_low` / `_high` only return real values in AUTO.
+So a state persisted in OFF / HEAT / COOL carries `target_temp_low` and
+`target_temp_high` **present with a `None` value**.
+
+**Always guard restore on the value, never on key presence:**
+
+```python
+if attrs.get(ATTR_TARGET_TEMP_LOW) is not None:   # correct
+if ATTR_TARGET_TEMP_LOW in attrs:                 # WRONG — float(None) raises
+```
+
+Getting this wrong is not a cosmetic bug.  A raise out of
+`async_added_to_hass` aborts `add_to_platform_finish`, so the entity is
+never added and the device simply *doesn't exist* after a restart —
+with the only clue an `Error adding entity` line in the log.  It also
+hides itself: on the next reload `RestoreEntity` stores the entity
+registry's `unavailable` / `restored: true` placeholder, the restore
+block is skipped entirely, and the entity comes up clean on defaults.
+So "restart breaks it, manual reload fixes it" is the signature of this
+class of bug.  Shipped in the initial commit, found live 2026-08-06,
+fixed in #82.
+
+For that reason the whole restore body lives in `_restore_from_state()`
+behind a `try/except` — a bad attribute degrades to the `__init__`
+defaults instead of removing the device.  Keep it that way when adding
+restored attributes.
+
 ## Versioning & Releases
 
 **Release management is automated via `release-please`** (GitHub Actions):
@@ -264,6 +304,8 @@ rm -rf .pytest_cache __pycache__ .coverage
 
 - Tests are comprehensive — always run them before reporting a task complete
 - Avoid breaking preset or state restoration behavior (very sensitive areas)
+- Restore code guards on the attribute *value*, not key presence — see
+  "Restored attributes are present-but-`None` outside AUTO". Critical invariant.
 - Temperature calculations must maintain numeric precision (use TEMP_STEP consistently)
 - The real climate device's setpoint in AUTO is asymmetric: `low` for HEAT, `high - 1` for COOL (corrected from v4.0.0's `high` after live observation showed unit overshoot is positive-only, not symmetric). Critical invariant.
 - Master/slave (since #43): smart climate is the sole writer of the real device's
