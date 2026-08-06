@@ -1,5 +1,12 @@
 # Changelog
 
+## [6.0.2](https://github.com/HomeOps/HASS-Smart-Climate/compare/v6.0.1...v6.0.2) (2026-08-06)
+
+
+### Bug Fixes
+
+* **climate:** don't abort setup restoring a non-AUTO state ([#82](https://github.com/HomeOps/HASS-Smart-Climate/issues/82)) ([5df8f8e](https://github.com/HomeOps/HASS-Smart-Climate/commit/5df8f8ee577e472f468ac369f41f4f130091c54d))
+
 ## [6.0.1](https://github.com/HomeOps/HASS-Smart-Climate/compare/v6.0.0...v6.0.1) (2026-05-25)
 
 
