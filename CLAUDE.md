@@ -7,7 +7,7 @@
 - **Language**: Python 3.11+
 - **Framework**: Home Assistant custom component
 - **Owner**: @ocalvo (Oscar Calvo)
-- **Current Version**: 0.0.8 (managed by release-please)
+- **Current Version**: see `manifest.json` — managed by release-please, never hand-edited (and never mirrored here, or it drifts)
 - **Releases**: Published to GitHub Releases automatically via release-please workflow
 
 ### Key Features
@@ -63,7 +63,9 @@ All tests are in `tests/` and must be kept in sync with implementation changes.
   
 - **`custom_components/smart_climate/config_flow.py`**: Configuration UI
   - User setup flow
-  - Options flow for preset temperature adjustment
+  - Options flow for preset temperatures **and** the per-preset inside
+    sensors (since #81) — so existing installs can wire up Sleep / Away
+    zones without deleting and re-adding the integration
   
 - **`custom_components/smart_climate/const.py`**: Constants and defaults
   - Preset temperature ranges
@@ -81,6 +83,8 @@ All tests are in `tests/` and must be kept in sync with implementation changes.
   - Auto mode switching tests
   - Preset temperature tests
   - State restoration tests
+- **`tests/test_config_flow.py`**: Config flow and options flow
+- **`tests/conftest.py`**: Shared fixtures
 
 ### Configuration
 
@@ -111,9 +115,10 @@ less power** than smart_climate's deliberate-OFF cycling on a warm
 afternoon (1.17 kW avg vs. 23 W avg).  The unit's own ±0.5 °C
 hysteresis around the asymmetric setpoint already prevents the
 original min-frequency-floor symptom that motivated deliberate-OFF;
-adding wrapper cycling on top just adds compressor wear.  Below
-sections describe the historical design — the *current* behavior is
-simply "wrapper commits direction; unit handles its own hysteresis".
+adding wrapper cycling on top just adds compressor wear.  The current
+behavior is simply "wrapper commits direction; unit handles its own
+hysteresis" — see "Midea unit behaviour" below for the device
+observations that still constrain the design.
 
 The wrapper picks HEAT or COOL **once** per AUTO entry and holds it.  The
 real device's setpoint is **asymmetric** by direction:
@@ -152,12 +157,6 @@ HEAT pulses to push the room from 21.4 to ~22).  Band-edge setpoints
 fix this by leveraging the unit's own setpoint logic as defense in
 depth: even if the wrapper commits HEAT incorrectly, the unit won't
 actively pump heat unless the room is genuinely below the floor.
-
-The wrapper's existing in-band COOL hysteresis (restart at `mid + 0.75`,
-stop at `mid`) is still useful as a safety net during transition periods
-where outside cooling is faster than the unit's own dynamics could
-anticipate (see the cold-front transition walkthrough in design
-discussion).
 
 1. **Initial pick** (when no committed mode yet, e.g. AUTO entered fresh
    or after HA restart):
@@ -343,7 +342,8 @@ sensor.whole_home_temperature = (existing) — fallback
 ```
 
 Smart climate then picks which helper to read per preset.  Three
-config keys (all live on the config entry — no options-flow yet):
+config keys, settable at setup and editable afterwards via the
+options flow (since #81):
 
 | Preset                       | Config key                  | Default if unset            |
 |------------------------------|-----------------------------|-----------------------------|
@@ -413,13 +413,22 @@ Option 1 is the contract.
   nor aggregates a sensor.  Data flow is preset → sensor selection
   → climate → setpoint → real device, period.
 
-## v3.0.0 — Deliberate OFF in AUTO+COOL (asymmetric, narrow scope)
+## Midea unit behaviour — empirical notes
 
-> **Status:** implemented in v3.0.0 (PR #58).  Refines the v2.0.0
-> "never command OFF in AUTO" contract, but only for the case where
-> empirical evidence showed it actively wastes energy.
+> **Retracted design.**  v3.0.0 (#58) added "deliberate OFF in
+> AUTO+COOL"; v3.0.1 – v4.0.x layered wrapper-side in-band COOL
+> hysteresis on top.  **Both were removed in v5.0.0** — 2026-05-02 data
+> showed the wrapper's cycling drew ~50× the power of simply letting the
+> unit hold its own hysteresis around the asymmetric setpoint.
+> `COOL_RESTART_OFFSET`, the `_unit_command`-keyed OFF state and the
+> restart-offset behaviour table are **gone from the code**; see the NOTE
+> in `const.py` and the v5.0.0 CHANGELOG entry.  Don't reintroduce them
+> without new data.
+>
+> What survives is the device knowledge below.  It was expensive to
+> acquire, it is still true, and it constrains any future redesign.
 
-### What we observed
+### The COOL minimum-frequency floor
 
 With smart_climate in AUTO, `current = 21.5 °C`, `target = 25 °C`
 (home preset, low/high = 21/23 → midpoint 22), **COOL committed**:
@@ -437,7 +446,7 @@ the unit's internal dehumidification logic — many inverter ACs hold
 a minimum compressor speed in COOL to maintain dehumidification
 capacity even when temperature setpoint is met.
 
-### Why HEAT does NOT need this fix
+### Why HEAT does not floor
 
 Tested 2026-04-26 with HEAT in AUTO + room in band: **the unit
 properly idled its compressor**.
@@ -462,93 +471,20 @@ thermodynamics: dehumidification requires a cold coil to condense
 moisture, and only COOL gives you that.  It's not evidence about
 *how* COOL is controlled.
 
-So v2.0.0's "never command OFF" rule is *correct* for HEAT
-(start-up cost > min-freq idle cost, no protection penalty) and
-*wrong* for COOL on this unit (min-freq pumps unwanted cold air).
-v3 makes the correction asymmetric to match.
+The practical consequence for the *current* design: the asymmetric
+setpoint (HEAT `low`, COOL `high - 1`) is what keeps the COOL floor
+from pumping cold air into an already-cool room, because the unit
+never enters the low-load regime that triggers it.  That asymmetry is
+load-bearing, not cosmetic.
 
-### Risk assessment
+### Sensor resolution
 
-Damage risk from cycling COOL on/off is **low**:
+This deployment uses Aeotec Multisensor 7 sensors (0.1 °C).  Sub-degree
+resolution matters: `FLIP_MARGIN` is 0.5 °C, so a whole-degree sensor
+would step straight past the flip threshold and turn the two-tier flip
+logic below into a coin toss.
 
-- We use the manufacturer's `set_hvac_mode` service.  The unit's
-  firmware runs its own shutdown sequence (pump-down, valve
-  positioning) and startup sequence (soft-start ramp from low
-  frequency).  We're not yanking power.
-- Modern inverter units have built-in anti-short-cycle protection.
-  If the wrapper commands COOL within ~3-5 min of an OFF, the unit
-  queues the request internally.
-- Inverter compressors are far more cycle-tolerant than single-
-  stage; soft-start makes each cycle cheap in wear terms.
-- The OFF command we send is identical to what happens when a user
-  presses OFF on the wired thermostat — a normal manufacturer-
-  designed transition.
-
-Cumulative wear from extra cycling is real but minor (≈30 s of
-equivalent steady-state runtime per start).  The 2 °C band width
-in the Home preset should comfortably keep cycles under 2/hour in
-practice.
-
-Watch in live deployment:
-
-1. **Cycle frequency.** > 6 starts/hour sustained → add
-   `OFF_HOLD_UP` (Future Work #2 below).
-2. **Compressor restart frequency curve.** Healthy restart starts
-   low and ramps over ~30-60 s.  If `compressor_freq` jumps
-   straight to high, soft-start isn't engaging; revisit.
-3. **Protection trip codes** in HA logs after the first weeks.
-
-### Implemented behavior (v3.0.0 + v3.0.x hysteresis fixes)
-
-Sticky AUTO commitment from v2.0.0 is unchanged.  The unit command
-derived from the committed direction:
-
-| `_auto_mode` | `current` | Last command | Unit command |
-|--------------|-----------|--------------|--------------|
-| HEAT         | (any)                          | (any)        | HEAT (v2.0.0 unchanged) |
-| COOL         | `> high`                       | (any)        | COOL (v2.0.0) |
-| COOL         | `< low`                        | (any)        | COOL (v2.0.0; FLIP_DWELL → HEAT) |
-| COOL         | in band, `> mid`               | COOL         | COOL (keep cooling to mid) |
-| COOL         | in band, `≤ mid`               | COOL         | OFF |
-| COOL         | in band, `> mid + RESTART_OFF` | OFF / None   | COOL (lead the high edge) |
-| COOL         | in band, `≤ mid + RESTART_OFF` | OFF / None   | OFF |
-
-**In-band COOL hysteresis with offset restart**.  Two sequential
-fixes after the v3.0.0 deploy on 2026-04-26:
-
-1. **Stop at midpoint, not band edge.**  v3.0.0 returned OFF the
-   moment current re-entered `[low, high]` from above.  Live result:
-   2-min COOL pulses with no useful pull.  Fix: keep cooling until
-   `current ≤ mid` so each start does ~½-band of cooling.
-
-2. **Restart leads the high edge.**  Restarting at the high edge
-   (e.g. `> 23` for the [21, 23] home preset) is too late — by the
-   time the wrapper sees current cross 23, the unit's ramp + air-
-   circulation lag has already let the room overshoot.  Fix: restart
-   at `mid + COOL_RESTART_OFFSET` (default 0.75 °C above mid =
-   22.75 for home preset).  COOL flow reaches the sensor before
-   current would otherwise have hit high.
-
-State is keyed on `_unit_command` (the wrapper's last sent command):
-- Was OFF → stay OFF until current rises above `mid + RESTART_OFFSET`
-- Was COOL → stay COOL until current drops to `mid`
-- First sync (`None`) treated as OFF state (don't start uninvited)
-
-The 0.25 °C between restart threshold and high edge is intentional
-headroom for the unit's response lag, *not* unused band.  Tightens
-control vs. starting at the edge, at the cost of more frequent (but
-still meaningful) compressor pulls.
-
-**Requires a sub-degree (decimal) inside-temperature sensor.**  The
-hysteresis depends on resolving values like 22.7 vs. 22.8 to land
-inside the 0.25 °C lead-headroom band between the restart threshold
-and the high edge.  A whole-degree sensor would jump 22 → 23 and
-skip the threshold entirely, defeating the lead and reverting to
-start-at-high (the original short-cycling bug).  This deployment
-uses Aeotec Multisensor 7 sensors (0.1 °C resolution) — fine.  For
-coarser sensors, raise `COOL_RESTART_OFFSET` to at least
-`(sensor_resolution + 0.5 °C)` so the lead headroom is wider than
-one sensor step.
+## AUTO-mode control detail
 
 ### Two-tier flip logic (v3.1.0)
 
@@ -631,95 +567,17 @@ are *not* persisted — they re-arm naturally from sensor data and
 the worst-case latency on each is acceptable (`FLIP_DWELL` 30 min,
 `OUT_OF_BAND_ALERT_MINUTES` 30 min, short-cycle 1 h window).
 
-`hvac_action` returns `IDLE` (not `OFF`) on the wrapper whenever
-the unit_command is OFF — distinguishes "AUTO resting" from
-"user turned it off entirely".  Implemented via a `_unit_command`
-attribute set by `_async_sync_real_climate` and read by the
-`hvac_action` property.
-
-No anti-flap guards yet.  We deliberately shipped the simplest
-possible thing first (just a band check, no `OFF_HOLD_DOWN`,
-`OFF_HOLD_UP`, or `OFF_DEADBAND`).  If the live deployment shows
-short-cycling at the band edges, those guards are next — see
-"Future Work" below.
-
-### Integration with the per-preset inside-sensor work
-
-Both share one substrate: smart_climate's `current_temperature`
-(whatever sensor the active preset points at) drives all decisions.
-The per-preset sensor work changes *which* sensor; the deliberate-OFF
-work changes *what to do* with the value.  Compose cleanly.
-
-## Future Work — Deliberate-OFF refinements (not yet implemented)
-
-The v3.0.0 implementation is intentionally minimal.  These refinements
-are scoped but not built:
-
-### 1. Mode-flip transition OFF
+## Future Work — Mode-flip transition OFF (not implemented)
 
 When AUTO commits a HEAT↔COOL flip (FLIP_DWELL met), emit
-`old_mode → off → wait OFF_SETTLE → new_mode`.  Lets the compressor
-spin down, the reversing valve stabilise, and refrigerant pressures
-equalise before the new mode kicks in.  At most ~1–2 mode flips/day
-in normal use, so the cost of an extra startup is negligible.
-Default `OFF_SETTLE = 60 s`.
+`old_mode → off → wait OFF_SETTLE → new_mode` (default 60 s).  Lets the
+compressor spin down, the reversing valve stabilise, and refrigerant
+pressures equalise before the new mode kicks in.  At most ~1–2 flips/day
+in normal use, so an extra startup costs nothing measurable.
 
-### 2. COOL-side anti-flap guards
-
-If the live data shows the COOL unit short-cycling at the band
-edges (sub-10-minute on/off cycles), add:
-
-- `OFF_HOLD_DOWN` (default 60 s): require a sustained in-band
-  reading before triggering OFF.  Filters sensor jitter.
-- `OFF_HOLD_UP` (default 300 s): minimum OFF duration before
-  re-arming COOL.  Prevents re-starting the compressor the moment
-  current grazes the high edge.
-
-### 3. OFF on wrong-side COOL excursion (CANDIDATE)
-
-v3.0.0 deliberately keeps v2.0.0 behavior in the wrong-side COOL
-case: COOL committed + current < low → send COOL (and let
-`FLIP_DWELL` flip the committed direction to HEAT after 30 min).
-Per user direction at PR time: *"OFF only when tending to cool
-inside the band"*.
-
-The downside surfaces on cool spring/fall nights after a warm day:
-AUTO is still committed COOL from the afternoon, the room drifts
-below low overnight, and the wrapper sends COOL into a cold room
-for up to 30 minutes before the dwell-flip kicks in.  Empirically
-small (the unit modulates and the room is already cold so the
-gradient is small), but visible in logs.
-
-If this turns out to matter in the live deployment, the surgical
-fix is:
-
-```python
-if self._auto_mode == HVACMode.COOL:
-    if low <= inside <= high:
-        return HVACMode.OFF
-    if inside < low:           # NEW: don't fight the room
-        return HVACMode.OFF
-    return HVACMode.COOL
-```
-
-Decision deferred until we have overnight data showing the
-behavior is actually a problem.
-
-### 4. Wide-deadband HEAT (DEFERRED — empirically not needed)
-
-Originally proposed as a mirror of the COOL trigger.  Live testing
-2026-04-26 showed HEAT properly idles, so this is not implemented
-and not on the roadmap unless a different unit shows the symmetric
-defect.
-
-### Constants reserved for future use
-
-```python
-# const.py additions, when refinements are needed
-OFF_SETTLE     = 60     # seconds, mode-flip OFF duration
-OFF_HOLD_DOWN  = 60     # seconds in band before OFF (anti-jitter)
-OFF_HOLD_UP    = 300    # minimum OFF duration before re-arming COOL
-```
+This is the one deliberate-OFF-adjacent idea that survived the v5.0.0
+retraction, because it is about *transitions* rather than steady-state
+cycling — the thing the 2026-05-02 power data actually indicted.
 
 ## Future Work — Fan time percentage (Ecobee-style)
 
@@ -728,10 +586,7 @@ OFF_HOLD_UP    = 300    # minimum OFF duration before re-arming COOL
 Per-preset `home_fan_pct` / `sleep_fan_pct` / `away_fan_pct`
 (default 0). When HVAC is OFF or idle, run the unit's fan at low
 speed for *N* minutes per hour to circulate air, distribute
-temperature, and lightly dehumidify. Useful particularly when
-deliberate-OFF (above) is keeping the compressor stopped for long
-stretches — the room would benefit from passive air mixing during
-those periods.
+temperature, and lightly dehumidify.
 
 Implementation note: Midea XYE supports FAN_ONLY mode. The fan-time
 loop alternates the real device between OFF (during the fan-off
@@ -747,7 +602,7 @@ forgotten; **out of scope for the next release**:
   fresh-air intake. When smart_climate is running cooling overnight
   at low outdoor temperatures and the fresh-air damper is open,
   fresh cold air rushes in and amplifies the over-cooling problem.
-  Coupling: when in deliberate-OFF, optionally close the damper too;
+  Coupling: when the unit is idle, optionally close the damper too;
   when running fan-only with `*_fan_pct`, open the damper for free
   passive cooling on cool nights.
 - **CO₂ sensors.** Indoor CO₂ trending up = need fresh air →
@@ -755,11 +610,14 @@ forgotten; **out of scope for the next release**:
   exchange. Below threshold, normal logic applies.
 
 These are **out of scope until the basics are right**. Don't
-implement them in the same release as deliberate-OFF or fan-time —
-keep each refinement tractable and testable.
+implement them in the same release as fan-time — keep each
+refinement tractable and testable.
 
 ## References
 
 - [Home Assistant Climate API](https://developers.home-assistant.io/docs/core/entity/climate/)
 - [HACS Documentation](https://hacs.xyz/)
 - [Release Please Configuration](https://github.com/googleapis/release-please/blob/main/docs/config.md)
+
+---
+*Last garbage-collected: 2026-08-06*
