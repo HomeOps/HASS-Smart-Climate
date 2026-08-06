@@ -35,7 +35,7 @@ from homeassistant.const import (
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant, State, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity
@@ -360,7 +360,13 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
         """Run when entity is added; restore state and subscribe to changes."""
         await super().async_added_to_hass()
 
-        # Restore previous state
+        # Restore previous state.  Any failure here degrades to the
+        # __init__ defaults rather than taking the whole entity down: a
+        # raise out of async_added_to_hass aborts add_to_platform_finish,
+        # so the device silently fails to appear at all (and a manual
+        # reload then "fixes" it, because the removal path overwrites the
+        # stored state with the unavailable placeholder).  Restoring seven
+        # loosely-typed attributes is not worth that blast radius.
         last_state = await self.async_get_last_state()
         if last_state is not None and last_state.state not in (
             STATE_UNAVAILABLE,
@@ -368,42 +374,14 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
             None,
         ):
             try:
-                self._hvac_mode = HVACMode(last_state.state)
-            except ValueError:
-                self._hvac_mode = HVACMode.OFF
-
-            attrs = last_state.attributes
-            restored_preset = attrs.get("preset_mode", PRESET_HOME)
-            self._preset_mode = (
-                restored_preset if restored_preset in SUPPORTED_PRESETS else PRESET_HOME
-            )
-            if ATTR_TARGET_TEMP_LOW in attrs:
-                self._target_temp_low = float(attrs[ATTR_TARGET_TEMP_LOW])
-            if ATTR_TARGET_TEMP_HIGH in attrs:
-                self._target_temp_high = float(attrs[ATTR_TARGET_TEMP_HIGH])
-            if ATTR_TEMPERATURE in attrs and attrs[ATTR_TEMPERATURE] is not None:
-                self._target_temperature = float(attrs[ATTR_TEMPERATURE])
-
-            # Restore the AUTO state machine: the sticky committed
-            # direction and the last unit command.  Without this, every
-            # HA restart re-runs the initial pick — and on 2026-04-26
-            # that picked HEAT against a glitchy startup sensor reading
-            # (Z-Wave aggregator briefly reported 21.66 °C while
-            # sensors were re-initialising), committing the wrapper to
-            # 30 minutes of wrong-direction heating.  Persisting these
-            # across restarts keeps the state machine stable.
-            committed = attrs.get("auto_mode_committed")
-            if committed:
-                try:
-                    self._auto_mode = HVACMode(committed)
-                except ValueError:
-                    self._auto_mode = None
-            last_cmd = attrs.get("last_unit_command")
-            if last_cmd:
-                try:
-                    self._unit_command = HVACMode(last_cmd)
-                except ValueError:
-                    self._unit_command = None
+                self._restore_from_state(last_state)
+            except Exception:  # noqa: BLE001 - defensive, see comment above
+                _LOGGER.warning(
+                    "Could not restore previous state for %s; "
+                    "falling back to defaults",
+                    self.entity_id,
+                    exc_info=True,
+                )
 
         # Populate initial state from current entity states
         self._sync_from_real_climate()
@@ -431,6 +409,57 @@ class SmartClimateEntity(ClimateEntity, RestoreEntity):
                 self._async_entity_state_changed,
             )
         )
+
+    def _restore_from_state(self, last_state: State) -> None:
+        """Rehydrate internal state from a previously saved HA state.
+
+        Every attribute is checked for ``None`` rather than key presence.
+        HA's ClimateEntity emits ``target_temp_low`` / ``target_temp_high``
+        unconditionally whenever ``TARGET_TEMPERATURE_RANGE`` is advertised
+        (which we always do), and this wrapper only returns real values for
+        them in AUTO — so a state saved in OFF / HEAT / COOL carries the
+        keys with a ``None`` value.  Testing membership alone made
+        ``float(None)`` raise on every restart that didn't happen to be in
+        AUTO.  Attributes left as ``None`` keep their ``__init__`` defaults;
+        for a real preset the band is re-derived from ``_preset_ranges``.
+        """
+        try:
+            self._hvac_mode = HVACMode(last_state.state)
+        except ValueError:
+            self._hvac_mode = HVACMode.OFF
+
+        attrs = last_state.attributes
+        restored_preset = attrs.get("preset_mode", PRESET_HOME)
+        self._preset_mode = (
+            restored_preset if restored_preset in SUPPORTED_PRESETS else PRESET_HOME
+        )
+        if attrs.get(ATTR_TARGET_TEMP_LOW) is not None:
+            self._target_temp_low = float(attrs[ATTR_TARGET_TEMP_LOW])
+        if attrs.get(ATTR_TARGET_TEMP_HIGH) is not None:
+            self._target_temp_high = float(attrs[ATTR_TARGET_TEMP_HIGH])
+        if attrs.get(ATTR_TEMPERATURE) is not None:
+            self._target_temperature = float(attrs[ATTR_TEMPERATURE])
+
+        # Restore the AUTO state machine: the sticky committed
+        # direction and the last unit command.  Without this, every
+        # HA restart re-runs the initial pick — and on 2026-04-26
+        # that picked HEAT against a glitchy startup sensor reading
+        # (Z-Wave aggregator briefly reported 21.66 °C while
+        # sensors were re-initialising), committing the wrapper to
+        # 30 minutes of wrong-direction heating.  Persisting these
+        # across restarts keeps the state machine stable.
+        committed = attrs.get("auto_mode_committed")
+        if committed:
+            try:
+                self._auto_mode = HVACMode(committed)
+            except ValueError:
+                self._auto_mode = None
+        last_cmd = attrs.get("last_unit_command")
+        if last_cmd:
+            try:
+                self._unit_command = HVACMode(last_cmd)
+            except ValueError:
+                self._unit_command = None
 
     def _all_inside_sensor_ids(self) -> list[str]:
         """Return every configured inside-sensor id (deduplicated, stable order).

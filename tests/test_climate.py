@@ -1417,8 +1417,8 @@ class TestStateRestoration:
         self,
         hvac_mode: str = HVACMode.AUTO.value,
         preset_mode: str = PRESET_SLEEP,
-        target_temp_low: float = DEFAULT_SLEEP_MIN,
-        target_temp_high: float = DEFAULT_SLEEP_MAX,
+        target_temp_low: float | None = DEFAULT_SLEEP_MIN,
+        target_temp_high: float | None = DEFAULT_SLEEP_MAX,
         temperature: float | None = None,
         auto_mode_committed: str | None = None,
         last_unit_command: str | None = None,
@@ -1559,6 +1559,58 @@ class TestStateRestoration:
         assert entity._hvac_mode == HVACMode.OFF
         assert entity._preset_mode == PRESET_HOME
         hass.services.async_call.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_null_setpoint_range_does_not_abort_add(self):
+        """A state saved outside AUTO carries null target_temp_low/high.
+
+        HA's ClimateEntity always writes both keys when
+        TARGET_TEMPERATURE_RANGE is advertised, and this wrapper only
+        returns real values for them in AUTO — so every state persisted in
+        OFF / HEAT / COOL has them present but None.  Restoring must not
+        raise: a raise out of async_added_to_hass aborts
+        add_to_platform_finish and the entity never appears (observed live
+        on 2026-08-06, HA restarted while the thermostat was OFF).
+        """
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.OFF.value,
+            preset_mode=PRESET_HOME,
+            target_temp_low=None,
+            target_temp_high=None,
+        )
+        entity, _ = await self._setup_entity(last_state)
+
+        assert entity._hvac_mode == HVACMode.OFF
+        assert entity._preset_mode == PRESET_HOME
+        # Null setpoints leave the __init__ defaults intact
+        assert entity._target_temp_low == DEFAULT_HOME_MIN
+        assert entity._target_temp_high == DEFAULT_HOME_MAX
+
+    @pytest.mark.asyncio
+    async def test_null_temperature_does_not_abort_add(self):
+        """`temperature` is likewise null in the saved state when unset."""
+        last_state = self._make_last_state(hvac_mode=HVACMode.OFF.value)
+        last_state.attributes["temperature"] = None
+        entity, _ = await self._setup_entity(last_state)
+        assert entity._target_temperature == (DEFAULT_HOME_MIN + DEFAULT_HOME_MAX) / 2.0
+
+    @pytest.mark.asyncio
+    async def test_unrestorable_state_degrades_to_defaults(self):
+        """An unexpected restore failure must not take the entity down.
+
+        Belt-and-braces for the failure mode above: whatever future
+        attribute goes bad, the entity still gets added and just falls
+        back to its __init__ defaults.
+        """
+        last_state = self._make_last_state(
+            hvac_mode=HVACMode.AUTO.value, preset_mode=PRESET_HOME
+        )
+        last_state.attributes["target_temp_low"] = "not-a-number"
+
+        entity, _ = await self._setup_entity(last_state)
+
+        assert entity._target_temp_low == DEFAULT_HOME_MIN
+        assert entity._target_temp_high == DEFAULT_HOME_MAX
 
     @pytest.mark.asyncio
     async def test_invalid_preset_defaults_to_home(self):
